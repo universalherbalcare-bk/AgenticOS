@@ -34,6 +34,10 @@ import { describeExecTool } from "./bash-tools.descriptions.js";
 import { processGatewayAllowlist } from "./bash-tools.exec-host-gateway.js";
 import { executeNodeHostCommand } from "./bash-tools.exec-host-node.js";
 import {
+  composeExecBeforeSpawn,
+  createExecKernelAuthorityGate,
+} from "./bash-tools.exec-kernel-authority-gate.js";
+import {
   assertSupportedExecParams,
   createExecRequestPreparation,
   type ExecToolArgs,
@@ -494,6 +498,15 @@ export function createExecTool(
           throw new Error("exec internal error: local execution requires a resolved workdir");
         }
 
+        // No-op unless APEX_AUTHORITY_MODE=required; composed into beforeSpawn below.
+        const kernelAuthorityGate = createExecKernelAuthorityGate({
+          command: params.command,
+          cwd: workdir,
+          host,
+          elevated: elevatedRequested,
+          identity: defaults,
+        });
+
         const githubProfileDir =
           host === "gateway" && preparedRunEnvironment.managedLocalIdentity
             ? preparedRunEnvironment.localIdentityEnv.GH_CONFIG_DIR
@@ -600,7 +613,7 @@ export function createExecTool(
           processContinuationAvailable: allowBackground,
           startupSignal: signal,
           onUpdate,
-          beforeSpawn: revalidateGatewayApproval,
+          beforeSpawn: composeExecBeforeSpawn(revalidateGatewayApproval, kernelAuthorityGate),
           onSettledBeforeNotify: settlement.settle,
         });
         discardPreparedSandboxWorkdir = null;
