@@ -1,8 +1,3 @@
-/**
- * Gateway-host exec approval and allowlist handling.
- * Evaluates shell allowlists, auto-review, durable approvals, follow-up routing,
- * and approved command execution for gateway-backed exec calls.
- */
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import {
@@ -77,6 +72,15 @@ import {
   resolveExecHostApprovalContext,
   sendExecApprovalFollowupResult,
 } from "./bash-tools.exec-host-shared.js";
+/**
+ * Gateway-host exec approval and allowlist handling.
+ * Evaluates shell allowlists, auto-review, durable approvals, follow-up routing,
+ * and approved command execution for gateway-backed exec calls.
+ */
+import {
+  composeExecBeforeSpawn,
+  type ExecBeforeSpawnGate,
+} from "./bash-tools.exec-kernel-authority-gate.js";
 import { appendExecTimeoutRetryGuidance } from "./bash-tools.exec-output.js";
 import {
   createApprovalSlug,
@@ -135,6 +139,12 @@ type ProcessGatewayAllowlistParams = {
   approvalFollowupText?: string;
   approvalFollowup?: ExecApprovalFollowupFactory;
   approvalFollowupMode?: "agent" | "direct";
+  /**
+   * APEX kernel authority gate for the detached continuation: when an "ask" approval is
+   * granted through the plane's own approval card and the command is executed later, that
+   * spawn must clear the kernel exactly as the inline spawn does. Absent in native mode.
+   */
+  kernelAuthorityGate?: ExecBeforeSpawnGate;
   warnings: string[];
   notifySessionKey?: string;
   approvalRunningNoticeMs: number;
@@ -1517,7 +1527,7 @@ export async function processGatewayAllowlist(
               sessionKey: params.notifySessionKey ?? params.sessionKey,
               timeoutSec: effectiveTimeout,
               startupSignal: params.signal,
-              beforeSpawn: async () => {
+              beforeSpawn: composeExecBeforeSpawn(async () => {
                 finalBindingDenied = await resolveGatewayExecApprovalDrift({
                   binding: approvalMutableFileBinding,
                   cwdSnapshot: approvedCwdSnapshot,
@@ -1527,7 +1537,7 @@ export async function processGatewayAllowlist(
                   throw finalBindingDeniedError;
                 }
                 return undefined;
-              },
+              }, params.kernelAuthorityGate),
             });
           } catch (error) {
             if (params.signal?.aborted) {

@@ -37,8 +37,6 @@ import type { AgentToolResult } from "./runtime/index.js";
 // ---------------------------------------------------------------------------
 
 const PENDING_MEMORY_MAX = 256;
-/** The kernel's own wording when a presented approval id exists but the human has not answered. */
-const STILL_PENDING = /live, unused approved request/i;
 const pendingApprovals = new Map<string, string>();
 
 function canonicalJson(value: unknown): string {
@@ -101,11 +99,14 @@ export function interpretKernelDecision(
   ) {
     return { kind: "pending", approvalId: decision.approval_id, decision };
   }
+  // The store's rejection wording is identical for a still-pending, a revoked and a spent
+  // record; the kernel returns the record's own status and that field alone decides whether
+  // to keep waiting. Anything but "pending" (including a missing field) is a hard denial.
   if (
     decision.decision === "deny" &&
     presented !== undefined &&
     decision.reason === "approval_rejected" &&
-    STILL_PENDING.test(decision.detail ?? "")
+    decision.record_status === "pending"
   ) {
     return {
       kind: "pending",

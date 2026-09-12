@@ -2706,6 +2706,72 @@ EOF`,
     expect(text).not.toContain("first line indented last line");
   });
 
+  it("the detached continuation's beforeSpawn composes the APEX kernel authority gate", async () => {
+    resolveExecHostApprovalContextMock.mockReturnValue({
+      approvals: { allowlist: [], file: { version: 1, agents: {} } },
+      hostSecurity: "allowlist",
+      hostAsk: "always",
+      askFallback: "deny",
+    });
+    mockApprovedDetachedExec({
+      outcome: { status: "completed", exitCode: 0, timedOut: false, aggregated: "done" },
+    });
+    const kernelDenied = {
+      content: [
+        { type: "text" as const, text: "Exec denied (kernel, tool_disabled): echo approved" },
+      ],
+      details: {
+        status: "failed" as const,
+        exitCode: null,
+        durationMs: 0,
+        aggregated: "",
+        timedOut: false,
+        reason: "policy-denied" as const,
+      },
+    };
+    let gateCalls = 0;
+    const result = await runGatewayAllowlist({
+      command: "echo approved",
+      approvalFollowupMode: "agent",
+      kernelAuthorityGate: async () => {
+        gateCalls += 1;
+        return kernelDenied;
+      },
+    });
+    expect(result.pendingResult?.details.status).toBe("approval-pending");
+    await vi.waitFor(() => {
+      expect(runExecProcessMock).toHaveBeenCalledTimes(1);
+    });
+    // runExecProcess is mocked here, so the composed hook is exercised directly: the kernel's
+    // denial must be what the real runtime would receive immediately before supervisor.spawn.
+    const call = runExecProcessMock.mock.calls[0]?.[0] as { beforeSpawn?: () => Promise<unknown> };
+    expect(typeof call.beforeSpawn).toBe("function");
+    await expect(call.beforeSpawn?.()).resolves.toEqual(kernelDenied);
+    expect(gateCalls).toBe(1);
+  });
+
+  it("the detached continuation's beforeSpawn lets the spawn proceed when the kernel gate allows", async () => {
+    resolveExecHostApprovalContextMock.mockReturnValue({
+      approvals: { allowlist: [], file: { version: 1, agents: {} } },
+      hostSecurity: "allowlist",
+      hostAsk: "always",
+      askFallback: "deny",
+    });
+    mockApprovedDetachedExec({
+      outcome: { status: "completed", exitCode: 0, timedOut: false, aggregated: "done" },
+    });
+    await runGatewayAllowlist({
+      command: "echo approved",
+      approvalFollowupMode: "agent",
+      kernelAuthorityGate: async () => undefined,
+    });
+    await vi.waitFor(() => {
+      expect(runExecProcessMock).toHaveBeenCalledTimes(1);
+    });
+    const call = runExecProcessMock.mock.calls[0]?.[0] as { beforeSpawn?: () => Promise<unknown> };
+    await expect(call.beforeSpawn?.()).resolves.toBeUndefined();
+  });
+
   it("fails closed when detached approval metadata cannot be persisted", async () => {
     resolveApprovalDecisionOrUndefinedMock.mockResolvedValue("allow-once");
     createExecApprovalDecisionStateMock.mockReturnValue({

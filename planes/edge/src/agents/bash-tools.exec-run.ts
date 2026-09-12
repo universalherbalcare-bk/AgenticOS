@@ -514,6 +514,7 @@ export function createExecTool(
 
         if (host === "gateway" && !bypassApprovals) {
           const gatewayResult = await processGatewayAllowlist({
+            kernelAuthorityGate,
             command: params.command,
             workdir,
             env,

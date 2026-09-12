@@ -78,12 +78,30 @@ export type AuthorityDecision = {
   resource?: string;
   risk?: AuthorityRisk;
   approval_id: string | null;
+  /** On approval_rejected only: the record's own status; adapters keep waiting only on "pending". */
+  record_status?: "pending" | "approved" | "consumed" | "revoked" | "expired" | null;
   payload_sha256?: string | null;
   expires_at?: number;
   consumed_at?: number;
 };
 
 /** APEX_AUTHORITY_MODE values recognized by adapters built on this client. */
+/**
+ * What `resolve` and `finish` return on success: the kernel's approval RECORD (status, reason,
+ * timestamps), never a decision. Only the fields adapters read are named.
+ */
+export type AuthorityRecord = {
+  id: string;
+  status: "pending" | "approved" | "consumed" | "revoked" | "expired";
+  reason: string;
+  outcome?: string;
+  [key: string]: unknown;
+};
+
+export type AuthorityRecordResult =
+  | { ok: true; record: AuthorityRecord }
+  | { ok: false; reason: "kernel_unreachable"; detail: string };
+
 export type KernelAuthorityMode = "required" | "native";
 
 /** Resolved adapter configuration, read from environment at call time. */
@@ -171,6 +189,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isRecordStatus(
+  value: unknown,
+): value is "pending" | "approved" | "consumed" | "revoked" | "expired" {
+  return (
+    value === "pending" ||
+    value === "approved" ||
+    value === "consumed" ||
+    value === "revoked" ||
+    value === "expired"
+  );
+}
+
 function isValidDecisionValue(value: unknown): value is "allow" | "deny" | "approval_required" {
   return value === "allow" || value === "deny" || value === "approval_required";
 }
@@ -246,14 +276,21 @@ function runAuthorityProcess(
   });
 }
 
-async function callAuthority(
-  payload: { op: "decide" | "resolve" | "finish"; directory?: string; [key: string]: unknown },
+type InvokeResult = { ok: true; result: unknown } | { ok: false; detail: string };
+
+function unreachable(detail: string): InvokeResult {
+  return { ok: false, detail };
+}
+
+/** One protocol round trip: spawn, write, read, parse, ok-check. Validation of `result` is the caller's. */
+async function invokeAuthority(
+  payload: Record<string, unknown>,
   env: NodeJS.ProcessEnv,
-): Promise<AuthorityDecision> {
+): Promise<InvokeResult> {
   const config = resolveKernelAuthorityConfig(env);
   const cmd = config.cmd;
   if (!cmd) {
-    return denyUnreachable("kernel authority not configured");
+    return unreachable("kernel authority not configured");
   }
   const directory = payload.directory ?? config.directory;
   const requestBody: Record<string, unknown> = { ...payload };
@@ -267,9 +304,7 @@ async function callAuthority(
   try {
     requestJson = JSON.stringify(requestBody);
   } catch (error) {
-    return denyUnreachable(
-      `kernel authority request could not be serialized: ${describeError(error)}`,
-    );
+    return unreachable(`kernel authority request could not be serialized: ${describeError(error)}`);
   }
 
   // The gated command's own environment is irrelevant here: this spawns the
@@ -290,7 +325,7 @@ async function callAuthority(
   }
 
   if (!isRecord(parsed) || typeof parsed.ok !== "boolean") {
-    return denyUnreachable(
+    return unreachable(
       error ? describeSpawnError(error) : "kernel authority returned an unparseable response",
     );
   }
@@ -299,15 +334,26 @@ async function callAuthority(
       typeof parsed.error === "string" && parsed.error.trim()
         ? parsed.error
         : "kernel authority denied the request";
-    return denyUnreachable(errorText);
+    return unreachable(errorText);
   }
   // ok === true but the process still reported a failure (should not happen per
   // protocol, but never trust a decision that arrived alongside a process error).
   if (error) {
-    return denyUnreachable(describeSpawnError(error));
+    return unreachable(describeSpawnError(error));
   }
 
-  const result = parsed.result;
+  return { ok: true, result: parsed.result };
+}
+
+async function callAuthority(
+  payload: { op: "decide" | "resolve" | "finish"; directory?: string; [key: string]: unknown },
+  env: NodeJS.ProcessEnv,
+): Promise<AuthorityDecision> {
+  const invoked = await invokeAuthority(payload, env);
+  if (!invoked.ok) {
+    return denyUnreachable(invoked.detail);
+  }
+  const result = invoked.result;
   if (!isRecord(result) || !isValidDecisionValue(result.decision)) {
     return denyUnreachable("kernel authority returned an unexpected decision value");
   }
@@ -320,6 +366,7 @@ async function callAuthority(
     ...(typeof result.resource === "string" ? { resource: result.resource } : {}),
     ...(isValidRiskValue(result.risk) ? { risk: result.risk } : {}),
     approval_id: typeof result.approval_id === "string" ? result.approval_id : null,
+    ...(isRecordStatus(result.record_status) ? { record_status: result.record_status } : {}),
     payload_sha256: typeof result.payload_sha256 === "string" ? result.payload_sha256 : null,
     ...(typeof result.expires_at === "number" ? { expires_at: result.expires_at } : {}),
     ...(typeof result.consumed_at === "number" ? { consumed_at: result.consumed_at } : {}),
@@ -339,17 +386,52 @@ export async function decide(
 }
 
 /** Relays a human's answer for a pending approval. Never throws. */
+const RECORD_STATUSES = new Set(["pending", "approved", "consumed", "revoked", "expired"]);
+
+function isValidRecord(value: unknown): value is AuthorityRecord {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.status === "string" &&
+    RECORD_STATUSES.has(value.status) &&
+    typeof value.reason === "string"
+  );
+}
+
+async function callAuthorityRecord(
+  request: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+): Promise<AuthorityRecordResult> {
+  const invoked = await invokeAuthority(request, env);
+  if (!invoked.ok) {
+    return { ok: false, reason: "kernel_unreachable", detail: invoked.detail };
+  }
+  if (!isValidRecord(invoked.result)) {
+    return {
+      ok: false,
+      reason: "kernel_unreachable",
+      detail: "kernel authority returned an unexpected record shape",
+    };
+  }
+  return { ok: true, record: invoked.result };
+}
+
+/**
+ * Relays the human's answer for a pending approval. The kernel replies with the approval
+ * RECORD (status approved or revoked), never a decision; a decision-shaped reply is refused.
+ * Never throws.
+ */
 export async function resolve(
   req: AuthorityResolveRequest,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<AuthorityDecision> {
-  return callAuthority({ op: "resolve", ...req }, env);
+): Promise<AuthorityRecordResult> {
+  return callAuthorityRecord({ op: "resolve", ...req }, env);
 }
 
 /** Records the outcome of an executed effect against its consumed approval. Never throws. */
 export async function finish(
   req: AuthorityFinishRequest,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<AuthorityDecision> {
-  return callAuthority({ op: "finish", ...req }, env);
+): Promise<AuthorityRecordResult> {
+  return callAuthorityRecord({ op: "finish", ...req }, env);
 }

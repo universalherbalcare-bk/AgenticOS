@@ -48,6 +48,14 @@ case "$mode" in
     printf '%s\\n' '{"ok":true,"result":{"decision":"allow","reason":"approval_consumed","operation":"tool.execute","resource":"exec:test","risk":"R3","approval_id":"${APPROVAL_ID_B}","consumed_at":1000}}'
     exit 0
     ;;
+  record_approved)
+    printf '%s\\n' '{"ok":true,"result":{"id":"${APPROVAL_ID_B}","status":"approved","reason":"user_approved"}}'
+    exit 0
+    ;;
+  record_consumed)
+    printf '%s\\n' '{"ok":true,"result":{"id":"${APPROVAL_ID_B}","status":"consumed","reason":"used_once","outcome":"succeeded"}}'
+    exit 0
+    ;;
   garbage)
     printf '%s\\n' 'not { valid json at all'
     exit 0
@@ -340,47 +348,64 @@ describeUnix("kernel-authority resolve() and finish()", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("resolve() sends op=resolve with approval_id/approve and returns the kernel's decision", async () => {
+  it("resolve() sends op=resolve with approval_id/approve and returns the kernel's approval RECORD; a decision-shaped reply is refused", async () => {
     const shim = writeShim(dir);
     const requestFile = requestFilePath(dir);
-    const decision = await resolve(
-      {
-        approval_id: APPROVAL_ID_B,
-        approve: true,
-        plane: "edge",
-        tool: "exec",
-        risk: "R3",
-        principal: { user_id: "u-1", channel: "edge" },
-        args: { command: "echo hi", cwd: "/work", host: "gateway" },
-      },
-      {
-        APEX_AUTHORITY_CMD: shim,
-        FAKE_AUTHORITY_MODE: "resolve_allow",
-        FAKE_AUTHORITY_REQUEST_FILE: requestFile,
-      },
-    );
-    expect(decision.decision).toBe("allow");
-    expect(decision.reason).toBe("approval_consumed");
+    const req = {
+      approval_id: APPROVAL_ID_B,
+      approve: true,
+      plane: "edge" as const,
+      tool: "exec",
+      risk: "R3" as const,
+      principal: { user_id: "u-1", channel: "edge" },
+      args: { command: "echo hi", cwd: "/work", host: "gateway" },
+    };
+    const result = await resolve(req, {
+      APEX_AUTHORITY_CMD: shim,
+      FAKE_AUTHORITY_MODE: "record_approved",
+      FAKE_AUTHORITY_REQUEST_FILE: requestFile,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.status).toBe("approved");
+      expect(result.record.id).toBe(APPROVAL_ID_B);
+    }
     const sent = JSON.parse(fs.readFileSync(requestFile, "utf8"));
     expect(sent.op).toBe("resolve");
     expect(sent.approval_id).toBe(APPROVAL_ID_B);
     expect(sent.approve).toBe(true);
+    // The real kernel never answers resolve with a decision; accepting one would mean the
+    // client was validated against the shim rather than the protocol.
+    const refused = await resolve(req, {
+      APEX_AUTHORITY_CMD: shim,
+      FAKE_AUTHORITY_MODE: "resolve_allow",
+    });
+    expect(refused.ok).toBe(false);
   });
 
-  it("finish() sends op=finish with approval_id/outcome and fails closed on denial", async () => {
+  it("finish() sends op=finish with approval_id/outcome, returns the consumed record, and fails closed on any other reply", async () => {
     const shim = writeShim(dir);
     const requestFile = requestFilePath(dir);
-    const decision = await finish(
+    const consumed = await finish(
       { approval_id: APPROVAL_ID_B, outcome: "succeeded" },
       {
         APEX_AUTHORITY_CMD: shim,
-        FAKE_AUTHORITY_MODE: "deny",
+        FAKE_AUTHORITY_MODE: "record_consumed",
         FAKE_AUTHORITY_REQUEST_FILE: requestFile,
       },
     );
-    expect(decision.decision).toBe("deny");
+    expect(consumed.ok).toBe(true);
+    if (consumed.ok) {
+      expect(consumed.record.status).toBe("consumed");
+      expect(consumed.record.outcome).toBe("succeeded");
+    }
     const sent = JSON.parse(fs.readFileSync(requestFile, "utf8"));
     expect(sent).toEqual({ op: "finish", approval_id: APPROVAL_ID_B, outcome: "succeeded" });
+    const denied = await finish(
+      { approval_id: APPROVAL_ID_B, outcome: "succeeded" },
+      { APEX_AUTHORITY_CMD: shim, FAKE_AUTHORITY_MODE: "deny" },
+    );
+    expect(denied.ok).toBe(false);
   });
 });
 

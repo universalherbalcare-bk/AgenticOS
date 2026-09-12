@@ -88,7 +88,14 @@ case "\${FAKE_AUTHORITY_MODE:-allow}" in
     ;;
   still_pending)
     case "$request" in
-      *approval_id*) printf '%s\\n' '{"ok":true,"result":{"decision":"deny","reason":"approval_rejected","detail":"A live, unused approved request is required.","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":null}}' ;;
+      *approval_id*) printf '%s\\n' '{"ok":true,"result":{"decision":"deny","reason":"approval_rejected","detail":"A live, unused approved request is required.","record_status":"pending","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":null}}' ;;
+      *) printf '%s\\n' '{"ok":true,"result":{"decision":"approval_required","reason":"approval_required","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":"${APPROVAL_ID}","expires_at":4102444800000}}' ;;
+    esac
+    exit 0
+    ;;
+  revoked)
+    case "$request" in
+      *approval_id*) printf '%s\\n' '{"ok":true,"result":{"decision":"deny","reason":"approval_rejected","detail":"A live, unused approved request is required.","record_status":"revoked","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":null}}' ;;
       *) printf '%s\\n' '{"ok":true,"result":{"decision":"approval_required","reason":"approval_required","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":"${APPROVAL_ID}","expires_at":4102444800000}}' ;;
     esac
     exit 0
@@ -275,6 +282,19 @@ describeUnix("exec tool kernel authority gate", () => {
     expect(spawnSpy).not.toHaveBeenCalled();
     expect(again.details).toMatchObject({ status: "approval-pending", approvalId: APPROVAL_ID });
     expect(JSON.parse(fs.readFileSync(fixture.requestFile, "utf8")).approval_id).toBe(APPROVAL_ID);
+  });
+
+  it("required + revoked: the same rejection wording as pending, but record_status makes it a hard denial, not a wait", async () => {
+    const fixture = withShim();
+    setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+    setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+    setTestEnvValue("FAKE_AUTHORITY_MODE", "revoked");
+
+    const tool = createExecTool();
+    await tool.execute("call-revoked-1", { command: "echo no" });
+    const denied = await tool.execute("call-revoked-2", { command: "echo no" });
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(denied.details).toMatchObject({ status: "failed", reason: "policy-denied" });
   });
 
   it("required + hard deny forgets the remembered id, so the next attempt starts a fresh proposal", async () => {
