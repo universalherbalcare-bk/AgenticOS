@@ -9,6 +9,23 @@
 # "token" inside a variable name. Zero real credentials. A gate that reds every run is a
 # gate the team learns to ignore, so this allowlist is scoped to exactly those classes.
 #
+# 2026-09-13, red team finding E2: the first version of this file exempted every
+# `*.test.{ts,tsx,js,mjs,py}`, `*_test.py`, `test_*.py`, `tests/` and `*.md` path from ALL
+# rules. Proved by execution: a live-shaped `sk-proj-` key and an AWS secret dropped into a
+# `.test.ts`, into a `tests/` file and into a `.md` doc produced zero findings. Those four
+# path classes are gone, and so are the narrower ones that followed them (test-support.ts,
+# test-utils.ts, test-helpers, test-fixtures.ts, cookbook/, qa/, qa-lab/). The 383 fixture
+# hits they were hiding (all read individually, all listed by VALUE below) are now exempted
+# by their exact value shape, or -- for PEM fixtures, whose "secret" is a multi-line block --
+# by exact path AND the private-key header, so a credential of any other shape in the same
+# file still fails the scan. The only path exemption left is one generated-content class.
+#
+# Known limit of the DEFAULT ruleset, not of this file: gitleaks' generic-api-key rule drops
+# a match whose line carries a stopword such as "example"; a key on a line reading
+# `A leaked key example: OPENAI_API_KEY = "sk-proj-..."` is missed in any file type, while
+# the same key on a plain assignment line is caught in .md, .py and .test.ts alike (verified
+# 2026-09-13 with gitleaks 8.30.1, with and without this config).
+#
 # Anything outside these paths and patterns still fails the job.
 
 title = "AgenticOS runtime"
@@ -16,31 +33,22 @@ title = "AgenticOS runtime"
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Fixture, documentation and generated-content paths; named public identifiers"
-regexTarget = "line"
+# ---------------------------------------------------------------------------------------
+# 1. Generated content and QA harnesses, by path.
 
+[[allowlists]]
+description = "Generated content, by path (the only path-class exemption)"
 paths = [
   # i18n translation memory: every line carries a sha256 cache_key of the source string
   '''planes/edge/ui/src/i18n/\.i18n/.*\.tm\.jsonl$''',
-  # test files and their helpers, in both planes (redaction and secret-detection tests
-  # deliberately contain key-shaped strings)
-  '''\.test\.(ts|tsx|js|mjs|py)$''',
-  '''_test\.py$''',
-  '''/test_[^/]+\.py$''',
-  '''/tests?/''',
-  '''test-support\.ts$''',
-  '''test-utils\.ts$''',
-  '''test-helpers?(/|\.ts$)''',
-  '''test-fixtures\.ts$''',
-  # documentation and examples
-  '''\.md$''',
-  '''planes/brain/cookbook/''',
-  # QA harness scenarios (synthetic transports, named room keys such as "e2ee-verification-dm")
-  '''planes/edge/qa/''',
-  '''planes/edge/extensions/qa-lab/''',
 ]
 
+# ---------------------------------------------------------------------------------------
+# 2. Named public identifiers in production source, matched on the whole line.
+
+[[allowlists]]
+description = "Named public identifiers (not secrets), exact line shapes"
+regexTarget = "line"
 regexes = [
   # public OAuth client ids: not secrets in a public-client (PKCE) flow
   '''XAI_OAUTH_CLIENT_ID\s*=\s*"b1a00492-073a-47ea-816f-4c329264a828"''',
@@ -57,4 +65,108 @@ regexes = [
   '''defaultMattermostWebSocketFactory''',
   # a keyword argument following the identifier `token` in a function call (agno/os/auth.py)
   '''token, treat_unverifiable_as_anonymous=not instance_has_auth''',
+]
+
+# ---------------------------------------------------------------------------------------
+# 3. Fixture VALUES, matched against the captured secret (anchored, whole value). Every
+#    entry below was read in its source on 2026-09-13. A value is listed here only when it
+#    is a counting run, an alphabet run, a spelled-out placeholder, a public identifier, or
+#    the base64 of a known test string -- i.e. it grants nothing anywhere. Any other value
+#    of the same provider shape (a random `sk-...`, a random 64-hex, a random UUID) is NOT
+#    matched and still fails the scan.
+
+[[allowlists]]
+description = "Synthetic fixture values: counting/alphabet placeholder tokens"
+regexes = [
+  # provider-prefixed placeholders (sk-, sk-proj-, sk-or-v1-, sk-test..., sk-live-, ghp_, glpat-,
+  # xoxb-, fc-, agno_pat_, 0x EVM keys) whose body is only "1234567890"/"0123456789"/"abcdef.."/
+  # "ghij"/"xyz"/"ZZZZ" runs
+  '''^(?:sk-(?:proj-|or-v1-|test-?|live-|secret|testsecret|abc)?|sk_test_|fc-|xoxb-|ghp_|glpat-|agno_pat_|0x)(?:[0-9]{7,20}|1234567890abcdef|abcdef1234567890|0123456789|abcdefghijklmnopqrst|abcdefghijklmnop|abcdefghij|abcdef|ABCDEF|ghij|klmnop|xyz|XYZ|ZZZZ|abcd|abc1234|[0-9]{3}XYZdef456)+$''',
+  # un-prefixed counting / alphabet runs and their concatenations (redaction-test bodies,
+  # EVM key fixtures, Feishu 22-char placeholder)
+  '''^(?:1234567890abcdef|abcdef1234567890|0123456789abcdef|fedcba9876543210|23456789abcdef01|abcdefghijklmnopqrstuvwx1234567890|abcdef1234567890ghij|ABCDEFGHIJKLMNOPQRSTUV)+$''',
+  # numeric-only 16-20 digit values: Discord snowflakes and "123456789012345678" placeholders
+  # are identifiers, not credentials (no rule's real secret is digits-only at this length)
+  '''^[0-9]{16,20}$''',
+  # AWS / Alibaba key-id fixtures spelled with the alphabet
+  '''^(?:AKIA|ASIA)ABCDEFGHIJKLMNOP$''',
+  '''^LTAI5tExampleFakeKeyXyz9$''',
+  # GitHub-app / Slack / Stripe / OpenRouter shaped fixtures that spell out what they are
+  '''^gh[uo]_[A-D]{4}UNIQUE(?:EMB|OFF)?SECRET[X-Z]{4}[0-9]{12}$''',
+  '''^xapp-1-(?:A0TOKEN-1-secret|A1B2C3-1234567890-abcdef0123456789abcdef0123456789)$''',
+  '''^https://hooks\.slack\.com/services/T1234567890/B1234567890/abcdefghijklmnopqrstuvwxy$''',
+  # JWT-shaped fixtures whose signature segment is the literal word "signature"/"sig"
+  '''^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.(?:signature[0-9]*|sig)$''',
+  '''^eyJhbGciOiJIUzI1NiJ9abcdef$''',
+  '''^eyJ1234567890abcd$''',
+]
+
+[[allowlists]]
+description = "Synthetic fixture values: base64 of known test strings and other spelled-out placeholders"
+regexes = [
+  # base64 of, in order: "the sample nonce" (RFC 6455), bytes 0x00..0x1f, "test-nonce-12345",
+  # "test-key-0123456", "secret:pass", "test-user:test-password", "AC123:super-secret-auth-token",
+  # "test-key-for-unit-tests-32bytes", "another-test-key-for-testing-32", and a Discord-token-shaped
+  # fixture built from "123456789012345678"
+  '''^(?:dGhlIHNhbXBsZSBub25jZQ==|AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=?|dGVzdC1ub25jZS0xMjM0NQ==|dGVzdC1rZXktMDEyMzQ1Ng==|c2VjcmV0OnBhc3M=|dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=|QUMxMjM6c3VwZXItc2VjcmV0LWF1dGgtdG9rZW4|dGVzdC1rZXktZm9yLXVuaXQtdGVzdHMtMzJieXRlcw==|YW5vdGhlci10ZXN0LWtleS1mb3ItdGVzdGluZy0zMg==|MTIzNDU2Nzg5MDEyMzQ1Njc4\.GaBcDe\.FgH|123456789012345678\.GaBcDe\.FgH)$''',
+  # placeholders that say what they are
+  '''^(?:YOUR_TOKEN|sk-litellm-key|sk-other-secret-token|test-key-0123456|test123456789|123456789suffix|abcd1234secret|bedrock-api-key-abc123|tail-secret-1234567890|private-secret-tail-1234567890|secret-api-key-123|opaque-abc123|internal-ticket-12345|acme-internal-bluefin-042|signature=aws-signature-123|SECRET_CANARY_69737|U2_R6_(?:RECEIPT_ID|POLICY_REF|MISSING_EVIDENCE)_SECRET_[0-9a-f]{6}|tok[0-9]+b?-boundary(?:-[0-9])?)$''',
+  # formerly path-exempted test helpers, cookbook examples and QA scenarios, now by value: a
+  # spelled-out JWT placeholder, a keyword-argument name, a Matrix QA room key name, three
+  # idempotency keys, and base64 of the byte runs 0x20..0x2f, "0123456789:;<=>?" and
+  # "`abc..z{|}~" (chrome-extension test-support auth ids)
+  '''^(?:scope-test-secret-at-least-256-bits-long|default_market=|e2ee-verification-dm|test-5369-(?:broader|policy|rotation)|ICEiIyQlJicoKSorLC0uLw|MDEyMzQ1Njc4OTo7PD0-Pw|YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8)$''',
+  # eight characters of two agno PATs followed by "..." in cookbook/examples/team_brain/TEST_LOG.md:
+  # a redacted display, not a token
+  '''^agno_pat_[A-Za-z0-9]{8}\.\.\.$''',
+  # a repeating-pattern Parallel key, a sequential-alphabet Google key, a Fernet-shaped token
+  # with "abcdefghij" inside, the NIP-19 spec's own example nsec, and a 1x1 PNG
+  '''^par-live-4c9d2e7ab1f0c9d2e7ab1f0c9d2e7$''',
+  '''^AIzaSyA1bC2dE3fG4hI5jK6lM7nO8pQrStUvW$''',
+  '''^gAAAAABpQnQrXzzZqcAfo3unbAY-ku84xgsvB0fpLkbDvSh3WS5qzfSCmcgwr8_abcdefghijvK2RyV2GQ4ohzcfYwhRwTvY76TvR7Tvr_$''',
+  '''^nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5$''',
+  '''^iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO\+/p9sAAAARcnVOZAAAAKIDABCDEFGHIJKLMNOP8JJRuAAAAABJRU5ErkJggg==$''',
+]
+
+[[allowlists]]
+description = "Identifiers the generic-api-key rule mistakes for values"
+regexes = [
+  # model ids, variable names, error class names, storage-key names, a key path, a shortcut
+  '''^(?:qwen3(?:\.5)?-(?:8b|4b)-instruct|qwen3\.5-plus|llama3\.3-70b-instruct|claude-opus-50|anthropic/(?:second|replacement|fresh)|synthetic/plain|discord-2026\.7\.1|legacy-topic-4[78]|tts/elevenlabs/apiKey|conversation-1|Ctrl\+Shift\+Esc|signing_key_material=|default_voice=|reserved-incognito-v1|DiscordThreadInitialMessageError|ChannelConfiguredBindingProvider)$''',
+  # UUID-shaped session keys used in tests, and the public XAI OAuth client id (exact literals;
+  # a UUID-shaped value not listed here still fails, since some vendors issue UUID keys)
+  '''^(?:b1a00492-073a-47ea-816f-4c329264a828|2d3c49c2-5a88-4e90-9a36-264834875ecc|01234567-89ab-4def-8123-456789abcdef|2fb701ef-6425-4c48-9b6f-5a170aa2477e|b0d79b63-0f73-4bc9-a6b5-6d8e20f42c3c|12345678-90ab-cdef-1234-567890abcdef)$''',
+  # an md5 cache key asserted by tests/unit/tools/test_functions.py, the SEED_KEY digest constant in
+  # node-worker-workspace-fallback.test.ts, and two Feishu document tokens (document identifiers)
+  '''^(?:d76d42a06e815b6402e24486f1f61805|f768fa4834ce38c2cc9d0050df323298de898870b2cf372c95da0a7965dad806|ZsJfdxrBFo0RwuxteOLc1Ekvneb|OtYpd5pKOoMeQzxrzkocv9KIn4H)$''',
+]
+
+# ---------------------------------------------------------------------------------------
+# 4. PEM fixtures. The private-key rule's "secret" is the whole multi-line block, so it is
+#    exempted by exact path AND the PEM header (condition = AND): only private-key findings in
+#    exactly these files are ignored; any other rule firing in them still fails.
+#
+#    Nine of these hold obviously fake bodies ("fake", "line-a", "multiline-body", base64 of
+#    "line1", a header alone). TWO hold genuine full-length RSA private keys that exist only to
+#    drive a test (a TLS-fingerprint mismatch in client.watchdog.test.ts, an APNs server key in
+#    push-apns.test.ts); they correspond to no deployed certificate and grant nothing, but they
+#    are real key material and the honest fix upstream is to generate them at test time, as
+#    push-apns.test.ts already does for `testAuthPrivateKey`.
+
+[[allowlists]]
+description = "PEM private-key fixtures inside exactly these test files"
+condition = "AND"
+regexes = ['''^-----BEGIN (?:RSA |OPENSSH |DSA )?PRIVATE KEY-----''']
+paths = [
+  '''^planes/brain/libs/agno/tests/unit/knowledge/test_github_loader\.py$''',
+  '''^planes/brain/libs/agno/tests/unit/knowledge/test_remote_content_config\.py$''',
+  '''^planes/edge/extensions/acpx/src/codex-auth-bridge\.test\.ts$''',
+  '''^planes/edge/extensions/msteams/src/sdk\.test\.ts$''',
+  '''^planes/edge/packages/gateway-client/src/client\.watchdog\.test\.ts$''',
+  '''^planes/edge/src/agents/sandbox/ssh\.test\.ts$''',
+  '''^planes/edge/src/cli/secrets-store-cli\.test\.ts$''',
+  '''^planes/edge/src/infra/push-apns\.auth\.test\.ts$''',
+  '''^planes/edge/src/infra/push-apns\.test\.ts$''',
+  '''^planes/edge/src/logging/redact\.test\.ts$''',
+  '''^planes/edge/test/scripts/detect-private-keys\.test\.ts$''',
 ]

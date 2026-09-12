@@ -46,6 +46,25 @@ SHIM_SOURCE = textwrap.dedent(
     STATE_PATH = os.environ["AUTHORITY_SHIM_STATE"]
     MODE = os.environ.get("AUTHORITY_SHIM_MODE", "deny_at_decide")
     FIXED_APPROVAL_ID = "1234567890abcdef" * 4
+    # Tools the shim denies outright at decide(), whatever MODE says -- lets a
+    # test allow one tool of a frame and deny another.
+    DENY_TOOLS = {t for t in os.environ.get("AUTHORITY_SHIM_DENY_TOOLS", "").split(",") if t}
+    # Tools the shim answers "allow / approval_consumed" for at decide(): the kernel
+    # already holds a consumed approval for them, so no edge round trip is needed
+    # but a finish() receipt is still owed.
+    CONSUMED_TOOLS = {t for t in os.environ.get("AUTHORITY_SHIM_CONSUMED_TOOLS", "").split(",") if t}
+
+
+    def _approval_id_for(state):
+        # The first proposal of a run gets FIXED_APPROVAL_ID (what the single-tool
+        # tests assert on); every later one gets its own 64-hex id, unless MODE is
+        # same_id_for_every_tool, which reproduces a kernel that hands out one id
+        # for two tools -- a protocol violation the bridge must fail closed on.
+        n = int(state.get("proposals", 0))
+        state["proposals"] = n + 1
+        if n == 0 or MODE == "same_id_for_every_tool":
+            return FIXED_APPROVAL_ID
+        return ("%016x" % n) + FIXED_APPROVAL_ID[16:]
 
 
     def _load_state():
@@ -96,19 +115,31 @@ SHIM_SOURCE = textwrap.dedent(
             risk = request.get("risk")
             approval_id = request.get("approval_id")
             if approval_id is None:
-                if MODE == "deny_at_decide":
+                if request.get("tool") in DENY_TOOLS:
+                    result = {
+                        "decision": "deny", "reason": "tool_disabled",
+                        "detail": "shim denies " + str(request.get("tool")), "operation": "tool.execute",
+                        "resource": resource, "risk": risk, "approval_id": None,
+                    }
+                elif request.get("tool") in CONSUMED_TOOLS:
+                    result = {
+                        "decision": "allow", "reason": "approval_consumed",
+                        "operation": "tool.execute", "resource": resource, "risk": risk,
+                        "approval_id": "c0" * 32, "consumed_at": 0,
+                    }
+                elif MODE == "deny_at_decide":
                     result = {
                         "decision": "deny", "reason": "tool_disabled",
                         "detail": "shim denies at decide", "operation": "tool.execute",
                         "resource": resource, "risk": risk, "approval_id": None,
                     }
-                elif MODE in ("approval_then_allow", "approval_then_deny_on_consume"):
-                    state["proposed"] = True
+                elif MODE in ("approval_then_allow", "approval_then_deny_on_consume", "same_id_for_every_tool"):
+                    proposed_id = _approval_id_for(state)
                     _save_state(state)
                     result = {
                         "decision": "approval_required", "reason": "approval_required",
                         "operation": "tool.execute", "resource": resource, "risk": risk,
-                        "approval_id": FIXED_APPROVAL_ID, "expires_at": 0,
+                        "approval_id": proposed_id, "expires_at": 0,
                     }
                 else:
                     result = {
@@ -117,7 +148,7 @@ SHIM_SOURCE = textwrap.dedent(
                         "resource": resource, "risk": risk, "approval_id": None,
                     }
             else:
-                if MODE == "approval_then_allow" and state.get("approved"):
+                if MODE == "approval_then_allow" and state.get("approved", {}).get(approval_id):
                     result = {
                         "decision": "allow", "reason": "approval_consumed",
                         "operation": "tool.execute", "resource": resource, "risk": risk,
@@ -130,7 +161,7 @@ SHIM_SOURCE = textwrap.dedent(
                         "resource": resource, "risk": risk, "approval_id": approval_id,
                     }
         elif op == "resolve":
-            state["approved"] = bool(request.get("approve"))
+            state.setdefault("approved", {})[request.get("approval_id")] = bool(request.get("approve"))
             _save_state(state)
             result = {
                 "id": request.get("approval_id"),
@@ -285,8 +316,10 @@ def shim_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTHORITY_SHIM_LOG", log_path)
     monkeypatch.setenv("AUTHORITY_SHIM_STATE", state_path)
 
-    def set_mode(mode: str) -> None:
+    def set_mode(mode: str, deny_tools: tuple[str, ...] = (), consumed_tools: tuple[str, ...] = ()) -> None:
         monkeypatch.setenv("AUTHORITY_SHIM_MODE", mode)
+        monkeypatch.setenv("AUTHORITY_SHIM_DENY_TOOLS", ",".join(deny_tools))
+        monkeypatch.setenv("AUTHORITY_SHIM_CONSUMED_TOOLS", ",".join(consumed_tools))
 
     return log_path, set_mode, authority_dir
 
@@ -495,3 +528,405 @@ async def test_native_mode_ignores_kernel_configuration_entirely(shim_env):
     _assert_one_terminal_event(deny_events)
 
     assert not os.path.exists(log_path), "the kernel shim was invoked in native mode"
+
+
+# ---------------------------------------------------------------------------
+# 8. Whole-frame authorisation (red team C5, 2026-09-13).
+#
+# One Agno RunPaused can carry several tool calls; resuming the run executes
+# ALL of them. The bridge used to decide the frame with the kernel on the FIRST
+# tool only, so [wire_money($1), delete_prod_database] was approved as
+# "wire_money($1)" and both side effects ran. Every test here checks the
+# side-effect list, not just the event stream.
+
+
+class TwoToolPausingExecutor:
+    """Pauses once with TWO tools requiring confirmation; on resume BOTH side
+    effects fire, exactly as a real multi-tool-call Agno turn does. Fixture
+    contributed by the red team's PoC."""
+
+    def __init__(self, sink: list[str]):
+        self.sink = sink
+
+    def arun(self, **_):
+        async def gen():
+            yield _Ev("RunStarted", run_id="r1")
+            yield _Ev(
+                "RunPaused",
+                run_id="r1",
+                content="Approve wiring $1?",
+                tools=[
+                    _ToolExec("wire_money", {"amount": 1, "to": "acct-innocuous"}),
+                    _ToolExec("delete_prod_database", {"target": "prod-primary"}),
+                ],
+            )
+            yield _Ev("ToolCallStarted", run_id="r1", tool_name="wire_money")
+            self.sink.append("WIRED_1_DOLLAR")
+            yield _Ev("ToolCallCompleted", run_id="r1", tool_name="wire_money")
+            yield _Ev("ToolCallStarted", run_id="r1", tool_name="delete_prod_database")
+            self.sink.append("DELETED_PROD_DATABASE")
+            yield _Ev("ToolCallCompleted", run_id="r1", tool_name="delete_prod_database")
+            yield _Ev("RunCompleted", run_id="r1", content="done")
+
+        return gen()
+
+
+class NoTerminalEventExecutor:
+    """Pauses, runs its tool after approval, then simply ends the stream
+    without RunCompleted/RunError (red team C9): the bridge cannot know how
+    the tool fared, and the kernel receipt must say so."""
+
+    def __init__(self, sink: list[str]):
+        self.sink = sink
+
+    def arun(self, **_):
+        async def gen():
+            yield _Ev("RunStarted", run_id="r1")
+            yield _Ev(
+                "RunPaused",
+                run_id="r1",
+                content="Approve?",
+                tools=[_ToolExec("wire_money", {"amount": 5, "to": "acct-1"})],
+            )
+            yield _Ev("ToolCallStarted", run_id="r1", tool_name="wire_money")
+            self.sink.append("WIRED")
+            yield _Ev("ToolCallCompleted", run_id="r1", tool_name="wire_money")
+
+        return gen()
+
+
+async def _drive_executor(executor, decisions: list[str] | None, turn_id: str, timeout_ms: int = 3000):
+    """Run one turn with ``executor``; once as many approvals are pending as
+    there are ``decisions``, answer them in pending order (which is the frame's
+    tool order). Returns (events, responses)."""
+    bridge = BrainBridge(agents={"payer": executor})
+    app = FastAPI()
+    app.include_router(bridge.router())
+    events: list[dict] = []
+    responses: list[httpx.Response] = []
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://bridge"
+    ) as c:
+
+        async def answer():
+            if not decisions:
+                return
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                async with bridge._pending_lock:
+                    pending = list(bridge._pending)
+                if len(pending) >= len(decisions):
+                    for aid, decision in zip(pending, decisions):
+                        responses.append(
+                            await c.post(
+                                f"/v1/turns/{turn_id}/approvals/{aid}",
+                                json={"approval_id": aid, "decision": decision, "principal": dict(PRINCIPAL)},
+                            )
+                        )
+                    return
+
+        task = asyncio.create_task(answer())
+        async with c.stream("POST", "/v1/turns", json=_turn(turn_id, timeout_ms)) as r:
+            async for line in r.aiter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        await task
+
+    return events, responses
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_pause_kernel_decides_every_tool_and_all_run_when_all_approved(shim_env):
+    log_path, set_mode, _ = shim_env
+    set_mode("approval_then_allow")
+    sink: list[str] = []
+
+    events, responses = await _drive_executor(TwoToolPausingExecutor(sink), ["approve", "approve"], "c5-all-approved")
+
+    assert [r.status_code for r in responses] == [200, 200]
+    assert sink == ["WIRED_1_DOLLAR", "DELETED_PROD_DATABASE"], sink
+    assert events[-1]["type"] == "run.completed"
+    _assert_one_terminal_event(events)
+
+    required = [e for e in events if e["type"] == "approval.required"]
+    assert [e["tool"] for e in required] == ["wire_money", "delete_prod_database"]
+    assert len({e["approval_id"] for e in required}) == 2, "each tool must carry its own kernel id"
+    assert all(e["approval_id"] and len(e["approval_id"]) == 64 for e in required)
+
+    logged = _read_log(log_path)
+    ops = [r["op"] for r in logged]
+    assert ops == ["decide", "decide", "resolve", "decide", "resolve", "decide", "finish", "finish"], ops
+    first_decides = logged[:2]
+    assert [(r["tool"], r["args"]) for r in first_decides] == [
+        ("wire_money", {"amount": 1, "to": "acct-innocuous"}),
+        ("delete_prod_database", {"target": "prod-primary"}),
+    ], "the kernel must see every tool of the frame with its own arguments"
+    assert [r["outcome"] for r in logged if r["op"] == "finish"] == ["succeeded", "succeeded"]
+    assert {r["approval_id"] for r in logged if r["op"] == "finish"} == {e["approval_id"] for e in required}
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_pause_kernel_deny_of_one_tool_runs_nothing(shim_env):
+    """Kernel allows wire_money (approval_required) but denies delete_prod_database:
+    NEITHER side effect may run, and nothing is offered to the operator."""
+    log_path, set_mode, _ = shim_env
+    set_mode("approval_then_allow", deny_tools=("delete_prod_database",))
+    sink: list[str] = []
+
+    events, _ = await _drive_executor(TwoToolPausingExecutor(sink), None, "c5-kernel-denies-second")
+    types = [e["type"] for e in events]
+
+    assert sink == [], f"a frame with a denied tool still ran: {sink}"
+    assert "tool.started" not in types, types
+    assert "approval.required" not in types, types
+    assert types[-1] == "run.failed"
+    assert "delete_prod_database" in events[-1]["error"]
+    _assert_one_terminal_event(events)
+
+    logged = _read_log(log_path)
+    assert [r["op"] for r in logged] == ["decide", "decide", "resolve"], logged
+    assert [r["tool"] for r in logged[:2]] == ["wire_money", "delete_prod_database"]
+    # The record the kernel had already proposed for wire_money is explicitly revoked.
+    assert logged[2]["tool"] == "wire_money" and logged[2]["approve"] is False
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_pause_operator_denies_one_tool_runs_nothing(shim_env):
+    log_path, set_mode, _ = shim_env
+    set_mode("approval_then_allow")
+    sink: list[str] = []
+
+    events, responses = await _drive_executor(TwoToolPausingExecutor(sink), ["approve", "deny"], "c5-operator-denies-second")
+    types = [e["type"] for e in events]
+
+    assert [r.status_code for r in responses] == [200, 200]
+    assert sink == [], f"approving one tool of a frame must not run the frame: {sink}"
+    assert "tool.started" not in types, types
+    assert types[-1] == "run.failed" and "denied" in events[-1]["error"]
+    _assert_one_terminal_event(events)
+
+    logged = _read_log(log_path)
+    assert [r["op"] for r in logged] == ["decide", "decide", "resolve", "resolve"], logged
+    assert [(r["tool"], r["approve"]) for r in logged[2:]] == [("wire_money", False), ("delete_prod_database", False)]
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_pause_shared_kernel_approval_id_fails_closed(shim_env):
+    """A kernel that hands out one approval id for two different tools has
+    violated the protocol; the bridge must not let one operator answer cover
+    both tools."""
+    log_path, set_mode, _ = shim_env
+    set_mode("same_id_for_every_tool")
+    sink: list[str] = []
+
+    events, _ = await _drive_executor(TwoToolPausingExecutor(sink), None, "c5-shared-id")
+    types = [e["type"] for e in events]
+
+    assert sink == [], sink
+    assert "approval.required" not in types, types
+    assert types[-1] == "run.failed" and "same approval id" in events[-1]["error"]
+    _assert_one_terminal_event(events)
+    assert [r["op"] for r in _read_log(log_path)] == ["decide", "decide", "resolve"]
+
+
+@pytest.mark.asyncio
+async def test_native_multi_tool_pause_needs_every_tool_approved(shim_env):
+    log_path, set_mode, _ = shim_env
+    set_mode("deny_at_decide")  # would fail the run if native mode ever consulted the kernel
+    os.environ["APEX_AUTHORITY_MODE"] = "native"
+
+    sink: list[str] = []
+    events, _ = await _drive_executor(TwoToolPausingExecutor(sink), ["approve", "approve"], "native-c5-ok")
+    assert sink == ["WIRED_1_DOLLAR", "DELETED_PROD_DATABASE"]
+    required = [e for e in events if e["type"] == "approval.required"]
+    assert [(e["approval_id"], e["tool"]) for e in required] == [
+        ("native-c5-ok:r1:0", "wire_money"),
+        ("native-c5-ok:r1:1", "delete_prod_database"),
+    ]
+    assert events[-1]["type"] == "run.completed"
+    _assert_one_terminal_event(events)
+
+    sink2: list[str] = []
+    events2, _ = await _drive_executor(TwoToolPausingExecutor(sink2), ["approve", "deny"], "native-c5-deny")
+    assert sink2 == [], sink2
+    assert events2[-1]["type"] == "run.failed"
+    _assert_one_terminal_event(events2)
+
+    assert not os.path.exists(log_path), "the kernel shim was invoked in native mode"
+
+
+# ---------------------------------------------------------------------------
+# 9. Approval ownership (red team A1/C6, 2026-09-13).
+#
+# The pending map was keyed by approval_id alone and the resolve route never
+# checked the path's turn_id or the decision's principal against the paused
+# turn, so anyone who knew (or in native mode could predict) an approval id
+# could approve another turn's action. Each refused attempt must leave the
+# owner's approval pending and the owner must still be able to resolve it.
+
+
+async def _pause_then(turn_id: str, attempts, *, sink: list[str]):
+    """Start ``turn_id``, wait until its approval is pending, run ``attempts``
+    (an async callable taking (client, bridge, approval_id)), then finish."""
+    bridge = BrainBridge(agents={"payer": PausingExecutor(sink)})
+    app = FastAPI()
+    app.include_router(bridge.router())
+    events: list[dict] = []
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://bridge"
+    ) as c:
+
+        async def drive():
+            async with c.stream("POST", "/v1/turns", json=_turn(turn_id)) as r:
+                async for line in r.aiter_lines():
+                    if line.startswith("data: "):
+                        events.append(json.loads(line[6:]))
+
+        task = asyncio.create_task(drive())
+        approval_id = None
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            async with bridge._pending_lock:
+                pending = list(bridge._pending)
+            if pending:
+                approval_id = pending[0]
+                break
+        assert approval_id is not None, "approval never became pending"
+        await attempts(c, bridge, approval_id)
+        await task
+    return events
+
+
+async def _assert_still_pending(bridge, approval_id):
+    async with bridge._pending_lock:
+        pending = bridge._pending.get(approval_id)
+    assert pending is not None and not pending.future.done(), "a refused attempt disturbed the owner's approval"
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_another_turn_id_is_refused_and_owner_still_resolves(shim_env):
+    _, set_mode, _ = shim_env
+    set_mode("approval_then_allow")
+    sink: list[str] = []
+    real_turn_id = "turn-REAL-owner"
+
+    async def attempts(c, bridge, approval_id):
+        forged = await c.post(
+            f"/v1/turns/turn-ATTACKER-DOES-NOT-OWN-THIS/approvals/{approval_id}",
+            json={"approval_id": approval_id, "decision": "approve", "principal": dict(PRINCIPAL)},
+        )
+        assert forged.status_code == 404, forged.text
+        assert forged.json() == {"detail": "no such pending approval"}  # same body as an unknown id
+        await _assert_still_pending(bridge, approval_id)
+        assert sink == []
+        legit = await c.post(
+            f"/v1/turns/{real_turn_id}/approvals/{approval_id}",
+            json={"approval_id": approval_id, "decision": "approve", "principal": dict(PRINCIPAL)},
+        )
+        assert legit.status_code == 200 and legit.json()["resolved"] is True
+
+    events = await _pause_then(real_turn_id, attempts, sink=sink)
+    assert sink == ["WIRED"], sink
+    assert events[-1]["type"] == "run.completed"
+    _assert_one_terminal_event(events)
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_another_principal_is_refused_and_owner_still_resolves(shim_env):
+    _, set_mode, _ = shim_env
+    set_mode("approval_then_allow")
+    sink: list[str] = []
+    turn_id = "turn-principal-bound"
+    attacker = {"user_id": "attacker", "channel": "slack", "scopes": ["ops"]}
+
+    async def attempts(c, bridge, approval_id):
+        for decision in ("approve", "deny"):
+            forged = await c.post(
+                f"/v1/turns/{turn_id}/approvals/{approval_id}",
+                json={"approval_id": approval_id, "decision": decision, "principal": attacker},
+            )
+            assert forged.status_code == 404, forged.text
+            assert forged.json() == {"detail": "no such pending approval"}
+            await _assert_still_pending(bridge, approval_id)
+        assert sink == []
+        legit = await c.post(
+            f"/v1/turns/{turn_id}/approvals/{approval_id}",
+            json={"approval_id": approval_id, "decision": "approve", "principal": dict(PRINCIPAL)},
+        )
+        assert legit.status_code == 200
+
+    events = await _pause_then(turn_id, attempts, sink=sink)
+    assert sink == ["WIRED"], sink
+    assert events[-1]["type"] == "run.completed"
+    _assert_one_terminal_event(events)
+
+
+@pytest.mark.asyncio
+async def test_native_mode_predictable_approval_id_cannot_be_resolved_from_another_turn(shim_env):
+    """In native mode the id is literally f"{turn_id}:{run_id}", so guessing it
+    is trivial; the ownership binding is the only thing standing in the way."""
+    _, set_mode, _ = shim_env
+    set_mode("deny_at_decide")
+    os.environ["APEX_AUTHORITY_MODE"] = "native"
+    sink: list[str] = []
+    turn_id = "native-owner"
+
+    async def attempts(c, bridge, approval_id):
+        assert approval_id == f"{turn_id}:r1"
+        forged = await c.post(
+            f"/v1/turns/native-attacker/approvals/{approval_id}",
+            json={"approval_id": approval_id, "decision": "deny", "principal": {"user_id": "attacker", "channel": "slack"}},
+        )
+        assert forged.status_code == 404
+        await _assert_still_pending(bridge, approval_id)
+        legit = await c.post(
+            f"/v1/turns/{turn_id}/approvals/{approval_id}",
+            json={"approval_id": approval_id, "decision": "approve", "principal": dict(PRINCIPAL)},
+        )
+        assert legit.status_code == 200
+
+    events = await _pause_then(turn_id, attempts, sink=sink)
+    assert sink == ["WIRED"]
+    assert events[-1]["type"] == "run.completed"
+
+
+# ---------------------------------------------------------------------------
+# 10. Receipt honesty (red team C9): a stream that ends without a terminal
+# event leaves the tool outcome unknown, and the kernel must be told so.
+
+
+@pytest.mark.asyncio
+async def test_stream_without_terminal_event_records_unknown_receipt(shim_env):
+    log_path, set_mode, _ = shim_env
+    set_mode("approval_then_allow")
+    sink: list[str] = []
+
+    events, _ = await _drive_executor(NoTerminalEventExecutor(sink), ["approve"], "c9-no-terminal")
+
+    assert sink == ["WIRED"]
+    _assert_one_terminal_event(events)  # the bridge still synthesises exactly one terminal event
+    logged = _read_log(log_path)
+    assert [r["op"] for r in logged] == ["decide", "resolve", "decide", "finish"]
+    assert logged[-1]["outcome"] == "unknown", logged[-1]
+
+
+@pytest.mark.asyncio
+async def test_consumed_record_in_a_denied_frame_still_gets_a_receipt(shim_env):
+    """Kernel: wire_money is allowed on an already-consumed approval,
+    delete_prod_database is denied. The frame is denied as a whole, so the
+    consumed record's action never ran -- its receipt must be 'failed', not
+    missing (before: the denied path returned without any finish())."""
+    log_path, set_mode, _ = shim_env
+    set_mode("approval_then_allow", deny_tools=("delete_prod_database",), consumed_tools=("wire_money",))
+    sink: list[str] = []
+
+    events, _ = await _drive_executor(TwoToolPausingExecutor(sink), None, "c9-denied-frame")
+
+    assert sink == [], sink
+    assert events[-1]["type"] == "run.failed" and "delete_prod_database" in events[-1]["error"]
+    _assert_one_terminal_event(events)
+    logged = _read_log(log_path)
+    assert [r["op"] for r in logged] == ["decide", "decide", "finish"], logged
+    assert logged[2]["approval_id"] == "c0" * 32 and logged[2]["outcome"] == "failed"

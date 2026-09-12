@@ -28,6 +28,18 @@ Ids are matched as a run of non-space characters after the status word, so a par
 truncated at that space -- identically on capture and on check. That is deliberate: the
 original failing baseline was recorded with the same rule, and the first error baseline
 was captured with a different one, which produced two false regressions for one id.
+
+What this gate cannot see, and therefore prints for a human (red team E5, 2026-09-13):
+
+* A baseline id that no longer fails looks identical whether the test was genuinely
+  fixed, deleted, renamed, skipped, or marked xfail. Every such id is listed BY NAME
+  under "NO LONGER FAILING" so the reviewer can check each one; the gate does not
+  block on them, because a subset comparison cannot distinguish the cases.
+* pytest reports a test failing under an xfail marker as "xfailed", not "failed", so
+  an xfail marker added in the merged tree hides a regression from the subset
+  comparison; and "xpassed" means an xfail marker is stale. Both counts are read from
+  the summary line and printed. They are informational: the pristine baseline was
+  captured without them, so there is nothing to compare against yet.
 """
 from __future__ import annotations
 
@@ -84,6 +96,7 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 2
     counted = {kind: int(n) for n, kind in re.findall(r"(\d+) (failed|error)", totals)}
+    expected_outcomes = {kind: int(n) for n, kind in re.findall(r"(\d+) (xfailed|xpassed)", totals)}
     parsed_failed = sum(1 for line in lines if FAILED_RE.match(line))
     parsed_error = sum(1 for line in lines if ERROR_RE.match(line))
     if counted.get("failed", 0) and not parsed_failed:
@@ -109,13 +122,29 @@ def main(argv: list[str]) -> int:
         regressions = sorted(observed - baseline)
         fixed = sorted(baseline - observed)
         print(f"{label} now: {len(observed)}  |  baseline: {len(baseline)}")
-        print(f"no longer {label} (tests of deleted modules, or genuinely fixed): {len(fixed)}")
+        print(f"no longer {label}: {len(fixed)}")
+        if fixed:
+            print(f"NO LONGER {label.upper()} -- verify each is a real fix, not a deleted, renamed, "
+                  "skipped or xfail'd test:")
+            for name in fixed:
+                print(f"  {name}")
         if regressions:
             print(f"\nREGRESSIONS ({label}) — in merged but not in pristine: {len(regressions)}")
             for r in regressions:
                 print(f"  {r}")
             status = 1
         print()
+
+    xfailed = expected_outcomes.get("xfailed", 0)
+    xpassed = expected_outcomes.get("xpassed", 0)
+    print(f"xfailed: {xfailed}  |  xpassed: {xpassed}")
+    if xfailed:
+        print(f"  {xfailed} test(s) failed under an xfail marker and are NOT counted as failures above; "
+              "an xfail marker added in the merged tree hides a regression -- review the diff for new markers")
+    if xpassed:
+        print(f"  {xpassed} test(s) passed despite an xfail marker (stale marker); "
+              "they are not counted as fixes above")
+    print()
 
     if status:
         return status

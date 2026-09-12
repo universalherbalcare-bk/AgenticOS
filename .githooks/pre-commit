@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# AgenticOS pre-commit gate. Committed to the repo so it cannot silently be absent:
+# `.pre-commit-config.yaml` describes the same gates for the `pre-commit` tool, but
+# that file does nothing until someone runs `pre-commit install`, and on 2026-09-13 the
+# red team found core.hooksPath unset and .git/hooks/pre-commit missing (finding E3), so
+# every gate it described was inert. Enable this one once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Every gate here fails CLOSED: a missing tool refuses the commit rather than skipping.
+# Gates 2-5 mirror `.pre-commit-config.yaml` and run only when a staged path matches the
+# same `files:` pattern that config uses; gate 1 (secrets) runs on every commit.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+fail() { printf 'pre-commit: %s\n' "$*" >&2; exit 1; }
+gate() { printf 'pre-commit: %s\n' "$*"; }
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+if [[ -z "$staged" ]]; then
+  gate "nothing staged; no gates to run"
+  exit 0
+fi
+
+# 1. Secrets in the STAGED content, with the repo's own config (which carries no blanket
+#    exemption for test or documentation paths -- see .gitleaks.toml).
+command -v gitleaks >/dev/null 2>&1 \
+  || fail "gitleaks is not installed (brew install gitleaks); refusing to commit unscanned changes"
+gate "1/5 gitleaks over staged changes"
+gitleaks git --staged --config .gitleaks.toml --no-banner --redact --exit-code 1 . \
+  || fail "gitleaks found a secret in the staged changes (see above); commit refused"
+
+# 2. Deletion ledger matches the tree (deleted paths absent, deferred paths present).
+if grep -qE '^(planes/|docs/deletions\.tsv)' <<<"$staged"; then
+  gate "2/5 deletion ledger matches the tree"
+  python3 scripts/check-deletion-ledger.py || fail "deletion ledger does not match the tree"
+else
+  gate "2/5 deletion ledger: no planes/ or docs/deletions.tsv change staged, skipped"
+fi
+
+# 3. Deletion integrity: no dangling refs, every surviving package imports. Needs an
+#    interpreter that can import agno; scripts/hook-deletion-integrity.sh refuses
+#    otherwise (set AGENTICOS_PYTHON to the venv interpreter).
+if grep -qE '^(planes/brain/|docs/deletions\.tsv)' <<<"$staged"; then
+  gate "3/5 deletion integrity (dangling refs + real imports)"
+  scripts/hook-deletion-integrity.sh || fail "deletion integrity gate failed"
+else
+  gate "3/5 deletion integrity: no planes/brain/ or docs/deletions.tsv change staged, skipped"
+fi
+
+# 4. TypeScript contract projection matches the canonical JSON Schema.
+if grep -qE '^bridge/' <<<"$staged"; then
+  gate "4/5 TypeScript contract parity"
+  command -v node >/dev/null 2>&1 || fail "node is not installed; cannot verify bridge/ts contract parity"
+  node --test bridge/ts/src/contract.parity.test.ts || fail "TypeScript contract has drifted from bridge/contract/turn.schema.json"
+else
+  gate "4/5 TypeScript contract parity: no bridge/ change staged, skipped"
+fi
+
+# 5. Python contract models match the canonical JSON Schema (needs pytest; the helper
+#    resolves .venv / AGENTICOS_PYTHON / python3 and refuses if none has it).
+if grep -qE '^(bridge/|tests/e2e/)' <<<"$staged"; then
+  gate "5/5 Python contract parity"
+  scripts/hook-contract-parity.sh || fail "Python contract models have drifted from bridge/contract/turn.schema.json"
+else
+  gate "5/5 Python contract parity: no bridge/ or tests/e2e/ change staged, skipped"
+fi
+
+gate "all gates passed"

@@ -42,7 +42,13 @@ areas, Agno wins 11.
 ./bin/agenticos verify     # run every gate, incl. cross-plane E2E
 ./bin/agenticos brain      # run the brain plane
 ./bin/agenticos edge --help  # run the edge plane CLI
+git config core.hooksPath .githooks   # once per clone: the committed pre-commit gate (gitleaks on
+                                      # staged changes, deletion ledger, contract parity), fails closed
 ```
+
+The brain-plane bridge logs one line at startup saying whether the APEX kernel governs tool calls.
+`APEX_AUTHORITY_MODE=native` (the default) logs a **WARNING** that the kernel is *not* in charge;
+`required` with `APEX_AUTHORITY_CMD` set is the only configuration that logs at INFO.
 
 ## The bridge
 
@@ -78,7 +84,8 @@ Every claim below was produced by running code in the session that built this.
 | Edge tests (merge-touched areas) | 1,037 passed / 54 files |
 | Edge CLI | `OpenClaw 2026.9.1` |
 | Brain control plane | 72 paths / 113 operations |
-| Pre-commit hooks (incl. gitleaks) | 9/9 passed |
+| Pre-commit hooks (incl. gitleaks) | 9/9 passed · `.githooks/pre-commit` proven to block a staged `sk-proj-` key |
+| Secret scan (`gitleaks git` over history, `gitleaks dir` over tracked files) | 0 findings with no test/doc path exemptions; 371 fixtures allowlisted by exact value shape |
 | TS contract parity + strict typecheck | 5 passed · `tsc` exit 0 (both gates proven failable) |
 | Approval-gate regression suite | 4 passed |
 

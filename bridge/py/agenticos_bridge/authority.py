@@ -39,6 +39,7 @@ calls ``logging`` itself.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from typing import Any, Mapping, MutableMapping, Optional
@@ -55,6 +56,7 @@ __all__ = [
     "MAX_STDOUT_BYTES",
     "get_mode",
     "is_configured",
+    "startup_notice",
     "decide",
     "resolve",
     "finish",
@@ -89,6 +91,48 @@ def is_configured(env: Optional[Mapping[str, str]] = None) -> bool:
     environment). Callers use this to distinguish "kernel said no" from
     "kernel was never wired up" before spending a round-trip."""
     return _str(_env(env), "APEX_AUTHORITY_CMD") is not None
+
+
+def startup_notice(env: Optional[Mapping[str, str]] = None) -> tuple[int, str]:
+    """The one line a plane adapter logs at startup about kernel governance.
+
+    Returns ``(logging level, message)``; this module still never logs, the
+    caller does. The level is WARNING whenever the kernel is NOT governing
+    tool calls -- native mode (the default, including an unset variable), a
+    garbled mode value (which ``get_mode`` fails closed to "required"), or
+    "required" without an ``APEX_AUTHORITY_CMD`` (every governed call will be
+    denied) -- and INFO only for a fully configured "required". Pure: reads
+    ``env`` (or the process environment), touches nothing else.
+    """
+    active = _env(env)
+    raw = _str(active, "APEX_AUTHORITY_MODE")
+    mode = get_mode(active)
+    command = _str(active, "APEX_AUTHORITY_CMD")
+    if mode == "native":
+        shown = "unset" if raw is None else repr(raw)
+        return (
+            logging.WARNING,
+            f"APEX kernel authority: mode=native (APEX_AUTHORITY_MODE {shown}); the APEX kernel "
+            "is NOT governing tool calls -- the bridge's own operator approval is the only gate. "
+            "Set APEX_AUTHORITY_MODE=required and APEX_AUTHORITY_CMD to put the kernel in charge.",
+        )
+    if raw not in _VALID_MODES:
+        prefix = (
+            f"APEX kernel authority: APEX_AUTHORITY_MODE={raw!r} is not a recognised value; "
+            "failing closed to mode=required. "
+        )
+    else:
+        prefix = "APEX kernel authority: mode=required. "
+    if command is None:
+        return (
+            logging.WARNING,
+            prefix + "APEX_AUTHORITY_CMD is not set, so every governed tool call will be DENIED "
+            "until it names the kernel launcher.",
+        )
+    return (
+        logging.INFO,
+        prefix + f"The APEX kernel governs every tool call via APEX_AUTHORITY_CMD={command}.",
+    )
 
 
 def _deny(reason: str, detail: str) -> dict:

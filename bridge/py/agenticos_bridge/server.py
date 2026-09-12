@@ -129,9 +129,30 @@ class IdempotencyStore:
 
 @dataclass
 class PendingApproval:
+    """One paused tool call awaiting an operator decision.
+
+    ``turn_id`` and ``principal`` are the ownership binding checked by
+    ``BrainBridge.resolve_approval``: a decision is accepted only when it names
+    this turn AND comes from the principal that started it. Before this binding
+    existed the map was keyed by approval_id alone, so any caller who knew (or,
+    in native mode, could predict -- ``f"{turn_id}:{run_id}"``) an approval id
+    could approve or deny another turn's paused action (red team A1/C6,
+    2026-09-13).
+    """
+
     future: asyncio.Future
     turn_id: str
+    principal: Principal
     created_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class _Gate:
+    """One tool call of a paused frame that still needs an operator decision."""
+
+    tool: str
+    args: dict
+    approval_id: str
 
 
 def _sse(payload: Any) -> str:
@@ -171,6 +192,11 @@ class BrainBridge:
         self._store = store or IdempotencyStore()
         self._pending: dict[str, PendingApproval] = {}
         self._pending_lock = asyncio.Lock()
+        # One unmistakable line, at bridge construction, saying whether the APEX
+        # kernel governs tool calls in this process (red team C7: nothing in the
+        # logs distinguished a governed bridge from an ungoverned one).
+        level, message = authority.startup_notice()
+        logger.log(level, message)
 
     # -- registry ---------------------------------------------------------
 
@@ -225,6 +251,11 @@ class BrainBridge:
         final_text: list[str] = []
         tool_calls = 0
         run_id: Optional[str] = None
+        # Set when the executor stream delivers its own terminal event. A stream
+        # that simply exhausts without one leaves the tool outcome genuinely
+        # unknown to the bridge, and the kernel receipt must say so (red team
+        # C9: it used to say "succeeded").
+        terminal_seen = False
         # Kernel approval ids consumed via _handle_pause in APEX_AUTHORITY_MODE
         # "required", awaiting a finish() receipt once this run's own outcome
         # is known. Empty in "native" mode and whenever the kernel path denied
@@ -289,6 +320,12 @@ class BrainBridge:
                     kernel_finish_ids.extend(outcome.get("kernel_finish_ids") or ())
                     if not outcome.get("approved", False):
                         await _aclose(stream)
+                        # Every kernel record this run consumed gets a receipt,
+                        # including one consumed inside a frame that was then
+                        # denied as a whole: the action did not run, so the
+                        # honest outcome for its record is "failed".
+                        if kernel_finish_ids:
+                            await self._finish_kernel_approvals(kernel_finish_ids, "failed")
                         return
 
                 elif name in _TERMINAL_ERR:
@@ -308,6 +345,7 @@ class BrainBridge:
                     return
 
                 elif name in _TERMINAL_OK:
+                    terminal_seen = True
                     content = getattr(ev, "content", None)
                     if isinstance(content, str) and content and not final_text:
                         final_text.append(content)
@@ -330,7 +368,15 @@ class BrainBridge:
             return
 
         if kernel_finish_ids:
-            await self._finish_kernel_approvals(kernel_finish_ids, "succeeded")
+            if not terminal_seen:
+                logger.warning(
+                    "bridge turn %s: executor stream ended without a terminal event; "
+                    "kernel receipts recorded as 'unknown'",
+                    req.turn_id,
+                )
+            await self._finish_kernel_approvals(
+                kernel_finish_ids, "succeeded" if terminal_seen else "unknown"
+            )
         yield _sse(
             RunCompleted(
                 turn_id=req.turn_id,
@@ -358,201 +404,274 @@ class BrainBridge:
             except Exception:  # noqa: BLE001 - see docstring
                 logger.debug("authority.finish failed for %s", approval_id, exc_info=True)
 
+    async def _revoke_kernel_approvals(
+        self, gates: Iterable[_Gate], principal_payload: Mapping[str, Any]
+    ) -> None:
+        """Best-effort ``resolve(approve=False)`` for kernel records that were
+        proposed for a frame the bridge is now denying as a whole, so the
+        kernel's own ledger shows them revoked rather than merely lapsing."""
+        for gate in gates:
+            try:
+                await asyncio.to_thread(
+                    authority.resolve,
+                    approval_id=gate.approval_id,
+                    approve=False,
+                    plane="brain",
+                    tool=gate.tool,
+                    risk="R3",
+                    principal=principal_payload,
+                    args=gate.args,
+                )
+            except Exception:  # noqa: BLE001 - revocation is bookkeeping, the frame is already denied
+                logger.debug("authority.resolve(revoke) failed for %s", gate.approval_id, exc_info=True)
+
     async def _handle_pause(
         self, req: TurnRequest, ev: Any, outcome: dict
     ) -> AsyncIterator[str]:
         """Translate an Agno RunPaused into a bridge approval round-trip.
 
         Sets ``outcome["approved"]`` so the caller can decide whether the run may
-        continue, and (in APEX_AUTHORITY_MODE "required", when an approval was
-        actually consumed) ``outcome["kernel_finish_ids"]`` so the caller can
-        send a finish() receipt once the run's own outcome is known. Emits a
-        terminal event ONLY when the answer is no; on approval it emits nothing
-        and the run proceeds to its own terminal event.
+        continue, and ``outcome["kernel_finish_ids"]`` (APEX_AUTHORITY_MODE
+        "required" only) listing every kernel approval record this frame
+        CONSUMED, so the caller can send a finish() receipt for each once the
+        run's own outcome is known. Emits a terminal event ONLY when the answer
+        is no; on approval it emits nothing and the run proceeds to its own
+        terminal event.
 
-        In APEX_AUTHORITY_MODE "native" (the default) this behaves exactly as
-        before: no kernel process is ever spawned, and the bridge's own
-        approval id / pending-future dance is the only gate. In "required":
+        THE FRAME IS THE UNIT OF AUTHORISATION. Agno resumes a paused run as a
+        whole: one continue executes every queued tool call. A version of this
+        method authorised only the first tool of the frame, so a frame of
+        ``[wire_money($1), delete_prod_database]`` reached the kernel as
+        "wire_money($1)", was approved on that basis, and both side effects ran
+        (red team C5, 2026-09-13). Now every tool in the frame is decided on its
+        own name and arguments, and the run resumes only when EVERY one of them
+        is allowed; a deny for any tool denies the whole frame, because the
+        runtime offers no way to resume some of a frame's tool calls and not
+        others.
 
-          1. Immediately on pause, the kernel is asked to `decide` on the
-             paused tool (risk R3, fixed by this integration -- Agno's own
-             `requires_confirmation` flag does not carry a risk class). A
-             `deny` fails the run without ever surfacing the approval to the
-             edge plane. An `allow` (low risk, or an already-consumed
-             approval) continues the run immediately, with no edge round
-             trip. Anything else must be `approval_required`; the KERNEL's
-             own approval id (not the bridge's) is what gets surfaced to the
-             edge in `ApprovalRequired`, so the edge's answer resolves the
-             kernel's own record.
-          2. When the edge's answer arrives: `approve` first calls kernel
-             `resolve(approve=True, ...)`, then `decide(..., approval_id=...)`
-             to consume the record; only a consumed `allow` continues the
-             run. `deny` calls kernel `resolve(approve=False, ...)` and fails
-             the run, exactly as the pre-kernel behaviour did (minus the
-             kernel record, which is now explicitly revoked instead of just
-             left pending for the bridge to forget about).
+        In APEX_AUTHORITY_MODE "native" (the default) no kernel process is ever
+        spawned; the bridge's own approval id / pending-future gate is the only
+        check, and it is applied per tool: one ``approval.required`` per tool
+        in the frame, all of which must be approved. In "required":
+
+          1. Immediately on pause, the kernel is asked to `decide` on EACH
+             tool in the frame (risk R3 -- Agno's own `requires_confirmation`
+             flag does not carry a risk class). Any `deny` fails the run
+             without surfacing anything to the edge, and revokes whatever
+             records the kernel had already proposed for the frame. Tools the
+             kernel answers `allow` need no edge round trip. Every tool
+             answered `approval_required` is surfaced to the edge as its own
+             ``approval.required`` carrying the KERNEL's approval id, so the
+             edge's answer resolves the kernel's own record. Two tools in one
+             frame sharing a kernel approval id is a protocol violation and
+             fails closed.
+          2. When the edge's answers arrive: the first `deny` revokes every
+             proposed record and fails the run. Once ALL are approved, each
+             record is `resolve(approve=True)`d and then consumed with
+             `decide(..., approval_id=...)`; only when every consume returns
+             `allow` does the run continue. A consume that does not allow
+             fails the run and revokes the records not yet resolved.
 
         A bridge-side approval TIMEOUT while running in "required" mode does
-        not itself call kernel `resolve`: the pending kernel record already
-        carries its own short TTL (<= 300s, see AuthorityService.propose) and
-        will lapse on its own. This is a deliberate simplification, not an
+        not itself call kernel `resolve`: the pending kernel records already
+        carry their own short TTL (<= 300s, see AuthorityService.propose) and
+        will lapse on their own. This is a deliberate simplification, not an
         oversight -- flagged here since a reviewer should be able to find it
         without re-deriving it from the diff.
         """
         outcome["approved"] = False
+        outcome["kernel_finish_ids"] = []
         mode = authority.get_mode()
-        tool_name, tool_args = _paused_tool_call(ev)
+        tools = _paused_tool_calls(ev)
         prompt_text = str(getattr(ev, "content", None) or "Approval required to continue.")
         principal_payload = req.principal.model_dump(exclude_none=True)
-        kernel_tool = tool_name or "unknown"
+        multi = len(tools) > 1
 
+        gates: list[_Gate] = []
         if mode == "required":
-            decide_result = await asyncio.to_thread(
-                authority.decide,
-                plane="brain",
-                tool=kernel_tool,
-                risk="R3",
-                principal=principal_payload,
-                args=tool_args,
-            )
-            decision_value = decide_result.get("decision")
-            if decision_value == "deny":
-                detail = decide_result.get("detail") or decide_result.get("reason") or "denied"
-                yield _sse(
-                    RunFailed(
-                        turn_id=req.turn_id,
-                        error=f"kernel authority denied: {detail}",
-                        retryable=False,
-                    )
+            consumed: list[str] = []
+            proposed: list[_Gate] = []
+            for name, args in tools:
+                kernel_tool = name or "unknown"
+                decide_result = await asyncio.to_thread(
+                    authority.decide,
+                    plane="brain",
+                    tool=kernel_tool,
+                    risk="R3",
+                    principal=principal_payload,
+                    args=args,
                 )
+                decision_value = decide_result.get("decision")
+                if decision_value == "allow":
+                    # Low risk under the kernel's own policy, or (per the
+                    # protocol doc) an already-consumed approval -- either way
+                    # the kernel has already spoken for this tool.
+                    already_consumed = decide_result.get("approval_id")
+                    if already_consumed and decide_result.get("reason") == "approval_consumed":
+                        consumed.append(already_consumed)
+                    continue
+                if decision_value == "approval_required":
+                    kernel_approval_id = decide_result.get("approval_id")
+                    if not isinstance(kernel_approval_id, str) or not kernel_approval_id:
+                        error = "kernel authority approval_required without an approval id"
+                    elif any(g.approval_id == kernel_approval_id for g in proposed):
+                        error = "kernel authority returned the same approval id for two tools"
+                    else:
+                        proposed.append(_Gate(tool=kernel_tool, args=args, approval_id=kernel_approval_id))
+                        continue
+                elif decision_value == "deny":
+                    detail = decide_result.get("detail") or decide_result.get("reason") or "denied"
+                    error = f"kernel authority denied {kernel_tool}: {detail}"
+                else:
+                    # authority.decide() only ever returns one of allow/deny/
+                    # approval_required (anything else is normalised to deny by
+                    # the client itself) -- this branch exists purely so a
+                    # future change to that contract fails closed here too.
+                    error = "kernel authority returned an unrecognised decision"
+                # Whole-frame deny: nothing in this frame may run.
+                await self._revoke_kernel_approvals(proposed, principal_payload)
+                outcome["kernel_finish_ids"] = consumed
+                yield _sse(RunFailed(turn_id=req.turn_id, error=error, retryable=False))
                 return
-            if decision_value == "allow":
-                # Low risk under the kernel's own policy, or (per the protocol
-                # doc) an already-consumed approval -- either way the kernel
-                # has already spoken; no edge round trip is needed.
+            outcome["kernel_finish_ids"] = consumed
+            if not proposed:
                 outcome["approved"] = True
-                already_consumed = decide_result.get("approval_id")
-                if already_consumed and decide_result.get("reason") == "approval_consumed":
-                    outcome["kernel_finish_ids"] = [already_consumed]
                 return
-            if decision_value != "approval_required":
-                # authority.decide() only ever returns one of allow/deny/
-                # approval_required (anything else is normalised to deny by
-                # the client itself) -- this branch exists purely so a future
-                # change to that contract fails closed here too, rather than
-                # falling through to the edge round trip below with a bogus
-                # approval id.
-                yield _sse(
-                    RunFailed(
-                        turn_id=req.turn_id,
-                        error="kernel authority returned an unrecognised decision",
-                        retryable=False,
-                    )
-                )
-                return
-            kernel_approval_id = decide_result.get("approval_id")
-            if not isinstance(kernel_approval_id, str) or not kernel_approval_id:
-                yield _sse(
-                    RunFailed(
-                        turn_id=req.turn_id,
-                        error="kernel authority approval_required without an approval id",
-                        retryable=False,
-                    )
-                )
-                return
-            approval_id = kernel_approval_id
+            gates = proposed
         else:
-            approval_id = f"{req.turn_id}:{getattr(ev, 'run_id', 'run')}"
+            base = f"{req.turn_id}:{getattr(ev, 'run_id', 'run')}"
+            for index, (name, args) in enumerate(tools):
+                # Single-tool frames keep the historical id shape; a multi-tool
+                # frame gets one id per tool so each can be answered on its own.
+                approval_id = f"{base}:{index}" if multi else base
+                gates.append(_Gate(tool=name or "unknown", args=args, approval_id=approval_id))
 
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
+        futures: dict[str, asyncio.Future] = {}
         async with self._pending_lock:
-            self._pending[approval_id] = PendingApproval(future=fut, turn_id=req.turn_id)
-        yield _sse(
-            ApprovalRequired(
-                turn_id=req.turn_id,
-                approval_id=approval_id,
-                prompt=prompt_text,
-                tool=tool_name or None,
+            for gate in gates:
+                fut: asyncio.Future = loop.create_future()
+                futures[gate.approval_id] = fut
+                self._pending[gate.approval_id] = PendingApproval(
+                    future=fut, turn_id=req.turn_id, principal=req.principal
+                )
+        for index, gate in enumerate(gates):
+            prompt = f"{prompt_text} [{index + 1}/{len(gates)}: {gate.tool}]" if multi else prompt_text
+            yield _sse(
+                ApprovalRequired(
+                    turn_id=req.turn_id,
+                    approval_id=gate.approval_id,
+                    prompt=prompt,
+                    tool=gate.tool if gate.tool != "unknown" or multi else None,
+                )
             )
-        )
+
+        denied = False
+        deadline = loop.time() + req.options.timeout_ms / 1000
         try:
-            decision: ApprovalDecision = await asyncio.wait_for(
-                fut, timeout=req.options.timeout_ms / 1000
-            )
+            waiting = set(futures.values())
+            while waiting and not denied:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                done, waiting = await asyncio.wait(
+                    waiting, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    raise asyncio.TimeoutError
+                for fut in done:
+                    decision: ApprovalDecision = fut.result()
+                    if decision.decision == "deny":
+                        denied = True
         except asyncio.TimeoutError:
             yield _sse(RunFailed(turn_id=req.turn_id, error="approval timed out", retryable=False))
             return
         finally:
             async with self._pending_lock:
-                self._pending.pop(approval_id, None)
+                for approval_id, fut in futures.items():
+                    self._pending.pop(approval_id, None)
+                    if not fut.done():
+                        fut.cancel()
 
-        if decision.decision == "deny":
+        if denied:
             if mode == "required":
-                await asyncio.to_thread(
-                    authority.resolve,
-                    approval_id=approval_id,
-                    approve=False,
-                    plane="brain",
-                    tool=kernel_tool,
-                    risk="R3",
-                    principal=principal_payload,
-                    args=tool_args,
-                )
+                await self._revoke_kernel_approvals(gates, principal_payload)
             yield _sse(
                 RunFailed(turn_id=req.turn_id, error="approval denied by operator", retryable=False)
             )
             return
 
         if mode == "required":
-            resolve_result = await asyncio.to_thread(
-                authority.resolve,
-                approval_id=approval_id,
-                approve=True,
-                plane="brain",
-                tool=kernel_tool,
-                risk="R3",
-                principal=principal_payload,
-                args=tool_args,
-            )
-            if not resolve_result.get("ok"):
-                yield _sse(
-                    RunFailed(
-                        turn_id=req.turn_id,
-                        error="kernel authority unreachable while resolving the approval",
-                        retryable=False,
-                    )
+            for position, gate in enumerate(gates):
+                resolve_result = await asyncio.to_thread(
+                    authority.resolve,
+                    approval_id=gate.approval_id,
+                    approve=True,
+                    plane="brain",
+                    tool=gate.tool,
+                    risk="R3",
+                    principal=principal_payload,
+                    args=gate.args,
                 )
-                return
-            consume_result = await asyncio.to_thread(
-                authority.decide,
-                plane="brain",
-                tool=kernel_tool,
-                risk="R3",
-                principal=principal_payload,
-                args=tool_args,
-                approval_id=approval_id,
-            )
-            if consume_result.get("decision") != "allow":
-                detail = consume_result.get("detail") or consume_result.get("reason") or "not allowed"
-                yield _sse(
-                    RunFailed(
-                        turn_id=req.turn_id,
-                        error=f"kernel authority did not allow the approved action: {detail}",
-                        retryable=False,
+                if not resolve_result.get("ok"):
+                    await self._revoke_kernel_approvals(gates[position + 1 :], principal_payload)
+                    yield _sse(
+                        RunFailed(
+                            turn_id=req.turn_id,
+                            error="kernel authority unreachable while resolving the approval",
+                            retryable=False,
+                        )
                     )
+                    return
+                consume_result = await asyncio.to_thread(
+                    authority.decide,
+                    plane="brain",
+                    tool=gate.tool,
+                    risk="R3",
+                    principal=principal_payload,
+                    args=gate.args,
+                    approval_id=gate.approval_id,
                 )
-                return
-            outcome["kernel_finish_ids"] = [approval_id]
+                if consume_result.get("decision") != "allow":
+                    detail = consume_result.get("detail") or consume_result.get("reason") or "not allowed"
+                    await self._revoke_kernel_approvals(gates[position + 1 :], principal_payload)
+                    yield _sse(
+                        RunFailed(
+                            turn_id=req.turn_id,
+                            error=f"kernel authority did not allow the approved action: {detail}",
+                            retryable=False,
+                        )
+                    )
+                    return
+                outcome["kernel_finish_ids"].append(gate.approval_id)
 
         outcome["approved"] = True
 
-    async def resolve_approval(self, decision: ApprovalDecision) -> bool:
+    async def resolve_approval(self, decision: ApprovalDecision, *, turn_id: str) -> bool:
+        """Deliver an operator decision to the paused turn that owns it.
+
+        Returns False -- indistinguishably -- when there is no such pending
+        approval, when it belongs to a different turn than ``turn_id``, or when
+        ``decision.principal`` is not the principal that started that turn. The
+        pending future is left untouched in every refused case, so a refused
+        attempt cannot consume, expire or otherwise disturb the owner's approval.
+
+        The binding is on ``user_id``: the other Principal fields (display
+        name, channel user, scopes) are descriptive or authorisation attributes
+        the edge may legitimately re-derive differently when it relays the
+        answer, none of them is secret, and scopes are already enforced by
+        ``_authorize`` -- requiring them here would add false rejections
+        without adding a check an attacker could not satisfy.
+        """
         async with self._pending_lock:
             pending = self._pending.get(decision.approval_id)
-        if pending is None or pending.future.done():
-            return False
-        pending.future.set_result(decision)
+            if pending is None or pending.future.done():
+                return False
+            if pending.turn_id != turn_id:
+                return False
+            if pending.principal.user_id != decision.principal.user_id:
+                return False
+            pending.future.set_result(decision)
         return True
 
     # -- router -----------------------------------------------------------
@@ -616,7 +735,10 @@ class BrainBridge:
             self._authorize(decision.principal)
             if decision.approval_id != approval_id:
                 raise HTTPException(status_code=400, detail="approval_id mismatch")
-            ok = await self.resolve_approval(decision)
+            # One status and one message for "unknown id", "not this turn's
+            # approval" and "not this turn's principal" alike: the response must
+            # not tell a caller whether an approval id exists.
+            ok = await self.resolve_approval(decision, turn_id=turn_id)
             if not ok:
                 raise HTTPException(status_code=404, detail="no such pending approval")
             return {"resolved": True, "approval_id": approval_id, "decision": decision.decision}
@@ -671,32 +793,38 @@ def _args_preview(ev: Any) -> Optional[str]:
         return str(args)[:512]
 
 
-def _paused_tool_call(ev: Any) -> tuple[str, dict]:
-    """Extract the paused tool's name and arguments from a RunPaused-family event.
+def _paused_tool_calls(ev: Any) -> list[tuple[str, dict]]:
+    """Every tool call a RunPaused-family event is waiting on, as (name, args).
 
     Agno's agent/team RunPausedEvent expose the tool(s) involved in the pause
     on `.tools`, a list of `agno.models.response.ToolExecution` (verified
     against agno/run/agent.py and agno/run/team.py in the installed package:
     both declare `tools: Optional[List[ToolExecution]]`). ToolExecution
     carries `.tool_name`, `.tool_args` (a dict) and `.requires_confirmation`.
-    When more than one tool is paused at once, the first one still requiring
-    confirmation is used; the kernel authority call only ever names one tool
-    per pause, so a simultaneous multi-tool pause is authorised against the
-    first such tool (a known limitation, not silently generalised).
 
-    Agno's Workflow/Step pause events (WorkflowPausedEvent, StepPausedEvent)
-    carry no ToolExecution-shaped attribute -- their tool arguments are
-    genuinely unavailable to the bridge, so `{}` is returned for those and
-    the tool name falls back to whatever `_tool_name` can find (typically the
-    step name).
+    The tools flagged `requires_confirmation` are returned, in order. If the
+    frame carries tools but none is flagged (Agno also pauses for user-input
+    and external-execution tools), every tool in the frame is returned rather
+    than none: the run DID pause, resuming it executes all of them, and the
+    bridge would rather over-ask than let a tool through unnamed. The result is
+    never empty -- a frame with no tool list at all yields one entry named by
+    whatever `_tool_name` can find (typically a workflow step name) with no
+    arguments, because Agno's Workflow/Step pause events carry no
+    ToolExecution-shaped attribute.
+
+    A previous version returned only the FIRST flagged tool; see
+    BrainBridge._handle_pause for why that was a whole-frame bypass.
     """
     tools = getattr(ev, "tools", None)
     if isinstance(tools, list) and tools:
-        chosen = next((t for t in tools if getattr(t, "requires_confirmation", False)), tools[0])
-        name = str(getattr(chosen, "tool_name", None) or "")
-        args = getattr(chosen, "tool_args", None)
-        return name, (dict(args) if isinstance(args, dict) else {})
-    return _tool_name(ev), {}
+        flagged = [t for t in tools if getattr(t, "requires_confirmation", False)]
+        calls = []
+        for tool in flagged or tools:
+            name = str(getattr(tool, "tool_name", None) or "")
+            args = getattr(tool, "tool_args", None)
+            calls.append((name, dict(args) if isinstance(args, dict) else {}))
+        return calls
+    return [(_tool_name(ev), {})]
 
 
 __all__ = ["BrainBridge", "IdempotencyStore"]
