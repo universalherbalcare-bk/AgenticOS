@@ -1,0 +1,6 @@
+{
+  "name": "@agenticos/bridge-contract",
+  "private": true,
+  "type": "module",
+  "description": "Declares the module format of bridge/ts/src for TypeScript's NodeNext resolution and for Node. Without this file the nearest package.json above the repository decides: on the machine that produced every recorded green typecheck that was a home-directory package.json with \"type\": \"module\"; on a clean checkout there is none, NodeNext defaults to CommonJS, and tsc fails on import.meta (TS1470). Found 2026-09-12 by the from-scratch Node 26 verification."
+}
