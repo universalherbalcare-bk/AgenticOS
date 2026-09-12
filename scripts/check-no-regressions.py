@@ -9,11 +9,25 @@ This gate encodes the comparison that actually matters instead: run the suite an
 assert the set of failing test ids is a SUBSET of the recorded pristine baseline.
 A brand-new failure fails the build; an inherited one does not.
 
-Baseline: tests/known-failing-baseline.txt — the failing ids observed on
+Baselines: tests/known-failing-baseline.txt — the failing ids observed on
 un-merged agno-main, captured in its own venv so the control could not import the
-merged package.
+merged package; tests/known-erroring-baseline.txt — the ids pytest reports as ERROR
+(collection/import failures, fixture errors), captured 2026-09-12 from the same tree.
+
+Both classes are gated. The first version of this script matched only `^FAILED`, and
+CI ran pytest with `-rf`, so ERROR lines were neither printed nor compared: a merge
+that broke a module's import would surface as ERROR, not FAILED, and pass unseen.
+CI now runs `-rfE`; a new ERROR outside its baseline fails the build like a new FAILED.
 
 Usage:  check-no-regressions.py <pytest-output-file>
+        check-no-regressions.py --capture <pytest-output-file>   # rewrite BOTH baselines
+                                                                # from that run, using the
+                                                                # exact parser used to check
+
+Ids are matched as a run of non-space characters after the status word, so a parametrize id containing a space is
+truncated at that space -- identically on capture and on check. That is deliberate: the
+original failing baseline was recorded with the same rule, and the first error baseline
+was captured with a different one, which produced two false regressions for one id.
 """
 from __future__ import annotations
 
@@ -23,10 +37,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "tests" / "known-failing-baseline.txt"
+ERROR_BASELINE = ROOT / "tests" / "known-erroring-baseline.txt"
 FAILED_RE = re.compile(r"^FAILED (\S+)")
+ERROR_RE = re.compile(r"^ERROR (\S+)")
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--capture":
+        lines = Path(argv[2]).read_text(errors="ignore").splitlines()
+        for pattern, path in ((FAILED_RE, BASELINE), (ERROR_RE, ERROR_BASELINE)):
+            ids = sorted({m.group(1) for line in lines if (m := pattern.match(line))})
+            path.write_text("\n".join(ids) + "\n")
+            print(f"wrote {len(ids)} ids -> {path.relative_to(ROOT)}")
+        return 0
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
@@ -34,30 +57,42 @@ def main(argv: list[str]) -> int:
     if not output.exists():
         print(f"pytest output not found: {output}", file=sys.stderr)
         return 2
-    if not BASELINE.exists():
-        print(f"baseline not found: {BASELINE}", file=sys.stderr)
+    for path in (BASELINE, ERROR_BASELINE):
+        if not path.exists():
+            print(f"baseline not found: {path}", file=sys.stderr)
+            return 2
+
+    lines = output.read_text(errors="ignore").splitlines()
+    if not any(line.startswith("ERROR ") or line.startswith("FAILED ") for line in lines) \
+            and not any("passed" in line and "==" in line for line in lines):
+        print("pytest output has no short summary; run pytest with -rfE", file=sys.stderr)
         return 2
 
-    baseline = {ln.strip() for ln in BASELINE.read_text().splitlines() if ln.strip()}
-    observed = {
-        m.group(1)
-        for line in output.read_text(errors="ignore").splitlines()
-        if (m := FAILED_RE.match(line))
-    }
+    def load(path):
+        return {ln.strip() for ln in path.read_text().splitlines() if ln.strip()}
 
-    regressions = sorted(observed - baseline)
-    fixed = sorted(baseline - observed)
+    def observe(pattern):
+        return {m.group(1) for line in lines if (m := pattern.match(line))}
 
-    print(f"failing now: {len(observed)}  |  baseline: {len(baseline)}")
-    print(f"no longer failing (tests of deleted modules, or genuinely fixed): {len(fixed)}")
+    status = 0
+    for label, pattern, baseline_path in (("failing", FAILED_RE, BASELINE),
+                                          ("erroring", ERROR_RE, ERROR_BASELINE)):
+        baseline = load(baseline_path)
+        observed = observe(pattern)
+        regressions = sorted(observed - baseline)
+        fixed = sorted(baseline - observed)
+        print(f"{label} now: {len(observed)}  |  baseline: {len(baseline)}")
+        print(f"no longer {label} (tests of deleted modules, or genuinely fixed): {len(fixed)}")
+        if regressions:
+            print(f"\nREGRESSIONS ({label}) — in merged but not in pristine: {len(regressions)}")
+            for r in regressions:
+                print(f"  {r}")
+            status = 1
+        print()
 
-    if regressions:
-        print(f"\nREGRESSIONS — fail in merged, pass in pristine: {len(regressions)}")
-        for r in regressions:
-            print(f"  {r}")
-        return 1
-
-    print("\nOK: zero regressions against the pristine baseline")
+    if status:
+        return status
+    print("OK: zero regressions against the pristine baselines (failures and errors)")
     return 0
 
 

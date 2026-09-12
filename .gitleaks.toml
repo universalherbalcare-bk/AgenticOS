@@ -1,0 +1,60 @@
+# gitleaks configuration for the AgenticOS runtime plane.
+#
+# Before this file existed the CI secrets job ran the default ruleset over the tree and
+# produced 110,963 findings on 2026-09-12 -- 110,550 of them SHA-256-shaped cache keys in
+# i18n translation-memory files, the rest fixtures inside test and documentation files, plus
+# 16 hits in production source that were read individually: two PUBLIC OAuth client ids
+# (one commented "shared public Grok client; auth method none"), storage-key names such as
+# "notifications.web.v1", an environment-variable NAME, and a rule matching the substring
+# "token" inside a variable name. Zero real credentials. A gate that reds every run is a
+# gate the team learns to ignore, so this allowlist is scoped to exactly those classes.
+#
+# Anything outside these paths and patterns still fails the job.
+
+title = "AgenticOS runtime"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixture, documentation and generated-content paths; named public identifiers"
+regexTarget = "line"
+
+paths = [
+  # i18n translation memory: every line carries a sha256 cache_key of the source string
+  '''planes/edge/ui/src/i18n/\.i18n/.*\.tm\.jsonl$''',
+  # test files and their helpers, in both planes (redaction and secret-detection tests
+  # deliberately contain key-shaped strings)
+  '''\.test\.(ts|tsx|js|mjs|py)$''',
+  '''_test\.py$''',
+  '''/test_[^/]+\.py$''',
+  '''/tests?/''',
+  '''test-support\.ts$''',
+  '''test-utils\.ts$''',
+  '''test-helpers?(/|\.ts$)''',
+  '''test-fixtures\.ts$''',
+  # documentation and examples
+  '''\.md$''',
+  '''planes/brain/cookbook/''',
+  # QA harness scenarios (synthetic transports, named room keys such as "e2ee-verification-dm")
+  '''planes/edge/qa/''',
+  '''planes/edge/extensions/qa-lab/''',
+]
+
+regexes = [
+  # public OAuth client ids: not secrets in a public-client (PKCE) flow
+  '''XAI_OAUTH_CLIENT_ID\s*=\s*"b1a00492-073a-47ea-816f-4c329264a828"''',
+  '''GITHUB_OAUTH_CLIENT_ID\s*=\s*"Ov23li[A-Za-z0-9]+"''',
+  # storage / config key NAMES that happen to end in _KEY
+  '''WEB_PUSH_USER_PREFERENCES_KEY\s*=\s*"notifications\.web\.v1"''',
+  '''REPAIR_JOURNAL_KEY\s*=\s*"reserved-incognito-v1"''',
+  # an environment-variable NAME, not its value
+  '''DISCORD_QA_KEEP_THREADS_ENV\s*=\s*"OPENCLAW_QA_DISCORD_KEEP_THREADS"''',
+  # a Rust unit-test literal in the Tauri gateway client
+  '''idempotency_key:\s*"idempotency-1"''',
+  '''idempotencyKey":\s*"idempotency-1"''',
+  # variable names the mattermost-access-token rule matches on the substring "token"
+  '''defaultMattermostWebSocketFactory''',
+  # a keyword argument following the identifier `token` in a function call (agno/os/auth.py)
+  '''token, treat_unverifiable_as_anonymous=not instance_has_auth''',
+]

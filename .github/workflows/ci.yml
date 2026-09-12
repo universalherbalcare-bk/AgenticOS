@@ -90,7 +90,7 @@ jobs:
         run: |
           set +e
           python -m pytest tests/unit \
-            --asyncio-mode=auto --continue-on-collection-errors --tb=no -q -rf \
+            --asyncio-mode=auto --continue-on-collection-errors --tb=no -q -rfE \
             > /tmp/pytest-merged.txt 2>&1
           set -e
           tail -1 /tmp/pytest-merged.txt
