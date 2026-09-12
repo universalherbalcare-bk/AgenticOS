@@ -1,0 +1,130 @@
+name: AgenticOS CI
+
+# One CI system for one OS. Before the merge there were two (Agno's 7 workflows,
+# OpenClaw's 101). This is the merged gate: it blocks on red for BOTH planes and
+# on the contract that joins them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  NODE_VERSION: "26"
+
+jobs:
+  merge-integrity:
+    name: Merge integrity (deletion ledger)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - name: Install brain plane
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e planes/brain/libs/agno
+      - name: Deletion ledger matches the tree
+        run: python scripts/check-deletion-ledger.py
+      # Runs on the job interpreter, which installed the brain plane above. The
+      # script REFUSES (exit 2) on an interpreter that cannot import agno, because
+      # it would otherwise report success having imported nothing.
+      - name: Every deleted module has zero inbound refs, every survivor imports
+        run: python scripts_audit_dangling_refs.py
+
+  bridge:
+    name: Bridge contract + cross-plane E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e planes/brain/libs/agno
+          pip install fastapi uvicorn python-multipart PyJWT websockets openai pytest pytest-asyncio httpx
+      - name: Contract parity + bridge suites
+        env:
+          PYTHONPATH: bridge/py
+        run: python -m pytest tests/e2e -q --asyncio-mode=auto
+      - name: Cross-plane end-to-end (TS edge -> Python brain)
+        env:
+          PYTHONPATH: bridge/py
+        run: |
+          python tests/e2e/brain_server.py &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8899/v1/bridge/health && break
+            sleep 0.5
+          done
+          node --test tests/e2e/cross_plane.test.ts
+
+  brain:
+    name: Brain plane (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e planes/brain/libs/agno
+          pip install pytest pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator
+      # The brain plane inherits ~277 upstream failures that need API keys or
+      # uninstalled vendor SDKs, so "pytest exits 0" can never be green and would
+      # train everyone to ignore this job. Gate on NEW failures instead.
+      - name: Unit tests (regression-gated against the pristine baseline)
+        working-directory: planes/brain/libs/agno
+        run: |
+          set +e
+          python -m pytest tests/unit \
+            --asyncio-mode=auto --continue-on-collection-errors --tb=no -q -rf \
+            > /tmp/pytest-merged.txt 2>&1
+          set -e
+          tail -1 /tmp/pytest-merged.txt
+      - name: Assert zero regressions vs pristine baseline
+        run: python scripts/check-no-regressions.py /tmp/pytest-merged.txt
+
+  edge:
+    name: Edge plane (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - run: corepack enable
+      - name: Install
+        working-directory: planes/edge
+        run: corepack pnpm install --frozen-lockfile --ignore-scripts
+      - name: CLI smoke
+        working-directory: planes/edge
+        run: node openclaw.mjs --version
+      - name: Bridge contract types (parity + strict typecheck)
+        run: |
+          node --test bridge/ts/src/contract.parity.test.ts
+          planes/edge/node_modules/.bin/tsc -p bridge/ts/tsconfig.json
+      - name: Tests for merge-touched areas
+        working-directory: planes/edge
+        run: corepack pnpm exec vitest run src/transcripts src/system-agent src/config/config.plugin-validation.test.ts
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

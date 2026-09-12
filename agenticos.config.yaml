@@ -1,0 +1,52 @@
+# AgenticOS — ONE config for both planes.
+#
+# Before the merge these were two separate configuration systems: Agno's 54-line
+# BaseSettings (env-only, no file loader) and OpenClaw's 253-module JSON5 stack.
+# The edge config system won on merit (layering, $include, fail-closed ${VAR}
+# substitution, generated JSON Schema, secret refs, hot reload), so this file is
+# the single operator-facing surface and the brain plane reads its settings from
+# the `brain:` block rather than from its own environment scheme.
+
+version: 1
+
+identity:
+  name: agenticos
+  # One trace context spans both planes; see bridge/contract/turn.schema.json.
+  service_namespace: agenticos
+
+bridge:
+  # The ONLY sanctioned boundary between planes.
+  contract: turn.v1
+  base_url: "http://127.0.0.1:8899"
+  # Fail closed: when set, the brain plane REQUIRES this bearer token.
+  # Never inline a secret here - use a ${VAR} reference resolved at load time.
+  auth_token: "${AGENTICOS_BRIDGE_TOKEN}"
+  # When set, a turn is refused unless the edge-asserted principal carries it.
+  required_scope: "turns:create"
+  timeout_ms: 120000
+
+brain:
+  # Python plane - agents, teams, workflows, reasoning, knowledge, memory.
+  host: "127.0.0.1"
+  port: 8899
+  # Provider-neutral default. Stock Agno hard-defaults to OpenAI at agent
+  # construction (agno/agent/_init.py:88) and raises ImportError without the
+  # OpenAI SDK; AgenticOS ships a zero-dependency default instead.
+  default_model: "agenticos-deterministic"
+  executors:
+    agents: []
+    teams: []
+    workflows: []
+
+edge:
+  # TypeScript plane - channels, gateway, devices, sandbox, browser, plugins.
+  # Channel credentials belong in the edge secret store, never in this file.
+  gateway:
+    enabled: true
+  channels: []
+
+observability:
+  # The edge OTLP stack won; the brain plane exports into the same collector
+  # rather than writing spans only to its own database.
+  otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+  service_name: agenticos

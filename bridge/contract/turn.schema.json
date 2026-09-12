@@ -1,0 +1,484 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenticos.dev/schemas/turn.v1.json",
+  "title": "AgenticOS Bridge Contract v1",
+  "description": "The single canonical contract crossing the AgenticOS plane boundary. The EDGE plane (TypeScript, OpenClaw lineage) owns channels/devices/sandbox. The BRAIN plane (Python, Agno lineage) owns agents/teams/workflows/knowledge/memory. This schema is the ONLY sanctioned way a turn crosses between them. Both planes generate their types from this file; neither hand-maintains a parallel copy.",
+  "version": "1.0.0",
+  "$defs": {
+    "TraceContext": {
+      "type": "object",
+      "description": "W3C-compatible trace context. ONE trace spans both planes so a turn is observable end to end.",
+      "required": [
+        "trace_id",
+        "span_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "trace_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "16-byte hex, W3C traceparent trace-id"
+        },
+        "span_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "8-byte hex, the EDGE-side span that originated the turn"
+        },
+        "sampled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "Target": {
+      "type": "object",
+      "description": "Which brain-plane executor should handle this turn.",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "agent",
+            "team",
+            "workflow"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "Attachment": {
+      "type": "object",
+      "required": [
+        "kind",
+        "uri"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "image",
+            "audio",
+            "video",
+            "file"
+          ]
+        },
+        "uri": {
+          "type": "string",
+          "description": "Edge-plane-resolvable URI. The brain plane MUST NOT assume local filesystem access."
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Principal": {
+      "type": "object",
+      "description": "Who is speaking, as resolved by the EDGE plane. The brain plane trusts this ONLY because the bridge is authenticated; it is never taken from model output.",
+      "required": [
+        "user_id",
+        "channel"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string",
+          "description": "Originating channel id, e.g. slack, discord, whatsapp, cli"
+        },
+        "channel_user": {
+          "type": "string",
+          "description": "Native per-channel user handle"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Authorisation scopes granted to this principal; the brain plane MUST enforce these, not merely log them."
+        }
+      }
+    },
+    "TurnRequest": {
+      "type": "object",
+      "description": "EDGE -> BRAIN. One inbound turn.",
+      "required": [
+        "turn_id",
+        "session_id",
+        "target",
+        "input",
+        "principal",
+        "trace"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "turn_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Idempotency key. Re-delivering the same turn_id MUST NOT execute twice."
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Conversation of record. Owned by the brain plane's session store."
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        },
+        "input": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Attachment"
+              },
+              "maxItems": 32
+            }
+          }
+        },
+        "principal": {
+          "$ref": "#/$defs/Principal"
+        },
+        "trace": {
+          "$ref": "#/$defs/TraceContext"
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stream": {
+              "type": "boolean",
+              "default": true
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 3600000,
+              "default": 120000
+            }
+          }
+        }
+      }
+    },
+    "Usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "TurnEvent": {
+      "description": "BRAIN -> EDGE, streamed as SSE. A discriminated union on `type`. Exactly one terminal event (run.completed | run.failed) ends a stream.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "run.started"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "text",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "output.delta"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "text",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "reasoning.delta"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "description": "Brain-plane reasoning trace. Agno emits ReasoningStarted/ReasoningStep/ReasoningContentDelta/ReasoningCompleted; without this member the bridge would silently discard the brain plane's strongest differentiator at the boundary. The EDGE plane MAY choose not to render these in a channel, but MUST receive them so traces stay complete."
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "tool",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "tool.started"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "args_preview": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "tool",
+            "ok",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "tool.completed"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "error": {
+              "type": "string"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "approval_id",
+            "prompt",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "approval.required"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "approval_id": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "description": "Human-in-the-loop crosses the bridge: the brain pauses, the EDGE renders the approval in the originating channel, and resumes via POST /v1/turns/{turn_id}/approvals/{approval_id}."
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "output",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "run.completed"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/Usage"
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "turn_id",
+            "error",
+            "ts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "run.failed"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean",
+              "default": false
+            },
+            "ts": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      ]
+    },
+    "ApprovalDecision": {
+      "type": "object",
+      "description": "EDGE -> BRAIN. Resolves an approval.required event.",
+      "required": [
+        "approval_id",
+        "decision",
+        "principal"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "approve",
+            "deny"
+          ]
+        },
+        "principal": {
+          "$ref": "#/$defs/Principal"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    }
+  },
+  "type": "object",
+  "properties": {
+    "TurnRequest": {
+      "$ref": "#/$defs/TurnRequest"
+    },
+    "TurnEvent": {
+      "$ref": "#/$defs/TurnEvent"
+    },
+    "ApprovalDecision": {
+      "$ref": "#/$defs/ApprovalDecision"
+    }
+  }
+}

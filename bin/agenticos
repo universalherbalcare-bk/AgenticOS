@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+/**
+ * AgenticOS — one command for both planes.
+ *
+ * This file is what makes the merge ONE operating system rather than two repos
+ * in a folder: a single entry point that knows about the brain plane (Python),
+ * the edge plane (TypeScript), the contract between them, and the gates that
+ * keep them honest.
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const BRAIN = join(ROOT, "planes", "brain");
+const EDGE = join(ROOT, "planes", "edge");
+const VENV_PY = join(ROOT, "..", ".venv", "bin", "python");
+
+const c = {
+  b: (s) => `\x1b[1m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  g: (s) => `\x1b[32m${s}\x1b[0m`,
+  r: (s) => `\x1b[31m${s}\x1b[0m`,
+  y: (s) => `\x1b[33m${s}\x1b[0m`,
+};
+
+function python() {
+  if (existsSync(VENV_PY)) return VENV_PY;
+  return process.env.AGENTICOS_PYTHON ?? "python3";
+}
+
+function readConfig() {
+  const p = join(ROOT, "agenticos.config.yaml");
+  if (!existsSync(p)) return null;
+  const text = readFileSync(p, "utf8");
+  // Deliberately minimal: enough to report identity and the bridge endpoint
+  // without adding a YAML dependency to the launcher. The edge plane owns real
+  // config parsing; this is a launcher, not a second config system.
+  const port = /^\s*port:\s*(\d+)/m.exec(text)?.[1];
+  const base = /base_url:\s*"([^"]+)"/.exec(text)?.[1];
+  const contract = /contract:\s*(\S+)/.exec(text)?.[1];
+  return { port, base, contract, path: p };
+}
+
+function run(cmd, args, opts = {}) {
+  return spawnSync(cmd, args, { stdio: "inherit", ...opts });
+}
+
+function ok(label, detail = "") {
+  console.log(`  ${c.g("✓")} ${label}${detail ? " " + c.dim(detail) : ""}`);
+}
+function bad(label, detail = "") {
+  console.log(`  ${c.r("✗")} ${label}${detail ? " " + c.dim(detail) : ""}`);
+}
+
+function doctor() {
+  console.log(c.b("\nAgenticOS doctor\n"));
+  let failures = 0;
+
+  const cfg = readConfig();
+  cfg ? ok("config", `${cfg.path} (contract ${cfg.contract})`) : (bad("config missing"), failures++);
+
+  const node = process.versions.node;
+  ok("node", `v${node}`);
+
+  const py = python();
+  const pv = spawnSync(py, ["--version"], { encoding: "utf8" });
+  pv.status === 0 ? ok("python", pv.stdout.trim() || pv.stderr.trim()) : (bad("python not found", py), failures++);
+
+  // Brain plane import check — the real one, not a file-exists check.
+  const brainCheck = spawnSync(
+    py,
+    ["-c", "import agno; from agno.agent import Agent; from agno.os import AgentOS; print(agno.__version__)"],
+    { encoding: "utf8", cwd: BRAIN },
+  );
+  brainCheck.status === 0
+    ? ok("brain plane", `agno ${brainCheck.stdout.trim()} imports`)
+    : (bad("brain plane import failed", (brainCheck.stderr || "").split("\n").pop()), failures++);
+
+  // Bridge contract check.
+  const bridgeCheck = spawnSync(
+    py,
+    ["-c", "from agenticos_bridge import CONTRACT_VERSION; print(CONTRACT_VERSION)"],
+    { encoding: "utf8", env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py") } },
+  );
+  bridgeCheck.status === 0
+    ? ok("bridge", `contract ${bridgeCheck.stdout.trim()}`)
+    : (bad("bridge import failed"), failures++);
+
+  // Edge plane check.
+  if (existsSync(join(EDGE, "node_modules"))) {
+    const edgeCheck = spawnSync("node", ["openclaw.mjs", "--version"], { encoding: "utf8", cwd: EDGE });
+    edgeCheck.status === 0
+      ? ok("edge plane", edgeCheck.stdout.trim())
+      : (bad("edge plane failed to run"), failures++);
+  } else {
+    bad("edge plane deps not installed", "run: agenticos install");
+    failures++;
+  }
+
+  console.log(
+    failures === 0
+      ? c.g("\nAll planes healthy.\n")
+      : c.r(`\n${failures} check(s) failed.\n`),
+  );
+  return failures === 0 ? 0 : 1;
+}
+
+function install() {
+  console.log(c.b("\nInstalling AgenticOS planes\n"));
+  console.log(c.dim("brain plane (python)"));
+  const r1 = run("uv", ["pip", "install", "-e", join(BRAIN, "libs", "agno")], {
+    env: { ...process.env, VIRTUAL_ENV: join(ROOT, "..", ".venv") },
+  });
+  console.log(c.dim("\nedge plane (node)"));
+  const r2 = run("corepack", ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], { cwd: EDGE });
+  return (r1.status ?? 0) || (r2.status ?? 0);
+}
+
+function brain() {
+  const cfg = readConfig();
+  console.log(c.b(`\nAgenticOS brain plane`) + c.dim(` :${cfg?.port ?? 8899}\n`));
+  const child = spawn(python(), [join(ROOT, "tests", "e2e", "brain_server.py")], {
+    stdio: "inherit",
+    env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py"), PORT: cfg?.port ?? "8899" },
+  });
+  child.on("exit", (code) => process.exit(code ?? 0));
+}
+
+function edge(args) {
+  const child = spawn("node", ["openclaw.mjs", ...args], { stdio: "inherit", cwd: EDGE });
+  child.on("exit", (code) => process.exit(code ?? 0));
+}
+
+function verify() {
+  console.log(c.b("\nAgenticOS verification gates\n"));
+  let failed = 0;
+
+  console.log(c.dim("1/5  deletion ledger matches the tree"));
+  if (run("python3", [join(ROOT, "scripts", "check-deletion-ledger.py")]).status !== 0) failed++;
+
+  // Must use the venv interpreter: on the system python3 the import half of this
+  // gate cannot import agno at all, and previously reported "193 packages import
+  // cleanly" having imported ZERO. The script now refuses on such an interpreter.
+  console.log(c.dim("\n2/5  deletion integrity (dangling refs + real package imports)"));
+  if (run(python(), [join(ROOT, "scripts_audit_dangling_refs.py")]).status !== 0) failed++;
+
+  console.log(c.dim("\n3/5  edge-side contract types typecheck (strict)"));
+  const tsc = join(ROOT, "planes", "edge", "node_modules", ".bin", "tsc");
+  if (existsSync(tsc)) {
+    if (run(tsc, ["-p", join(ROOT, "bridge", "ts", "tsconfig.json")]).status !== 0) failed++;
+  } else {
+    console.log(c.y("  skipped: edge plane deps not installed (run: agenticos install)"));
+    failed++;
+  }
+
+  console.log(c.dim("\n4/5  bridge contract + brain-side suites"));
+  if (
+    run(python(), ["-m", "pytest", join(ROOT, "tests", "e2e"), "-q", "--asyncio-mode=auto"], {
+      env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py") },
+    }).status !== 0
+  )
+    failed++;
+
+  console.log(c.dim("\n5/5  cross-plane end-to-end (TS edge -> Python brain)"));
+  const server = spawn(python(), [join(ROOT, "tests", "e2e", "brain_server.py")], {
+    env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py"), PORT: "8899" },
+    stdio: "ignore",
+    detached: true,
+  });
+  const started = Date.now();
+  let up = false;
+  while (Date.now() - started < 30000) {
+    const probe = spawnSync("curl", ["-sf", "http://127.0.0.1:8899/v1/bridge/health"], { encoding: "utf8" });
+    if (probe.status === 0) { up = true; break; }
+    spawnSync("sleep", ["0.5"]);
+  }
+  if (!up) {
+    bad("brain plane did not come up within 30s");
+    failed++;
+  } else if (run("node", ["--test", join(ROOT, "tests", "e2e", "cross_plane.test.ts")]).status !== 0) {
+    failed++;
+  }
+  try { process.kill(-server.pid); } catch {}
+
+  console.log(failed === 0 ? c.g("\nAll gates passed.\n") : c.r(`\n${failed} gate(s) failed.\n`));
+  return failed === 0 ? 0 : 1;
+}
+
+function usage() {
+  console.log(`
+${c.b("AgenticOS")} ${c.dim("— one agent OS, two planes")}
+
+  ${c.b("agenticos doctor")}     check both planes and the bridge
+  ${c.b("agenticos install")}    install brain (python) and edge (node) dependencies
+  ${c.b("agenticos brain")}      run the brain plane (agents/teams/workflows/knowledge)
+  ${c.b("agenticos edge")} ...   run the edge plane CLI (channels/gateway/sandbox)
+  ${c.b("agenticos verify")}     run every verification gate
+  ${c.b("agenticos matrix")}     show the capability decision matrix
+
+${c.dim("brain = Python (Agno lineage)  ·  edge = TypeScript (OpenClaw lineage)")}
+${c.dim("bridge contract: bridge/contract/turn.schema.json")}
+`);
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+switch (cmd) {
+  case "doctor": process.exit(doctor()); break;
+  case "install": process.exit(install()); break;
+  case "brain": brain(); break;
+  case "edge": edge(rest); break;
+  case "verify": process.exit(verify()); break;
+  case "matrix": run("cat", [join(ROOT, "docs", "DECISION-MATRIX.md")]); break;
+  default: usage(); process.exit(cmd ? 1 : 0);
+}

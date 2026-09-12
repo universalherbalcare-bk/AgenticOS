@@ -1,0 +1,44 @@
+# plane	path	category	justification
+brain	libs/agno/agno/tools/shell.py	security	Unsandboxed subprocess.run on host; own docstring calls it an RCE sink under prompt injection. Superseded by edge exec sandbox + approvals.
+brain	libs/agno/agno/tools/python.py	security	runpy.run_path in-process with safe_globals = globals(); the "restricted scope" is the real module globals. Superseded by CodeMode-in-sandbox.
+brain	libs/agno/agno/tools/docker.py	security	Hands the model the host Docker daemon (create/exec/remove). Daemon access is root-equivalent with no policy layer. Non-negotiable.
+brain	libs/agno/agno/tools/webbrowser.py	security	28 lines calling webbrowser.open_new_tab on the operator desktop; a UI-hijack primitive with no automation value.
+brain	libs/agno/agno/tools/e2b.py	security	Third-party hosted sandbox; redundant once the edge container sandbox is the execution substrate, and moves code off the policy-controlled machine.
+brain	libs/agno/agno/tools/daytona.py	security	Same as e2b.py.
+brain	libs/agno/agno/tools/local_file_system.py	security	Second file toolkit alongside agno/fs/; two file surfaces in one runtime is a policy hole. fs/ is the hardened one.
+brain	libs/agno/agno/guardrails/prompt_injection.py	security	18 hardcoded lowercase substrings providing false assurance next to the edge external-content scanner. Patterns salvaged as extra inputs first.
+brain	libs/agno/agno/tools/tool_registry.py	duplicate	One-line alias `Toolkit as ToolRegistry`; dead name colliding with the edge registry concept.
+brain	libs/agno/agno/integrations	duplicate	Whole tree is 3 files; a 208-line standalone discord.py bot AgentOS never mounts. Superseded by edge discord extension (71,368 LOC).
+brain	libs/agno/agno/os/interfaces/slack	duplicate	3,654 LOC webhook-only vs edge Slack 41,052 LOC with Socket Mode, modals, slash commands, native approvals.
+brain	libs/agno/agno/os/interfaces/telegram	duplicate	1,598 LOC webhook-only; structurally cannot poll. Superseded by edge telegram (63,082 LOC).
+brain	libs/agno/agno/os/interfaces/whatsapp	duplicate	911 LOC vs edge whatsapp 24,581 LOC.
+brain	libs/agno/agno/models/litellm	duplicate	LiteLLM as a Python-side abstraction is redundant once routing goes through edge protocol adapters; the edge already consumes LiteLLM pricing JSON.
+brain	libs/agno/agno/models/tuning_engines	duplicate	45 lines, one vendor, zero unique mechanism; replaced by a priced manifest row.
+brain	libs/agno/agno/vectordb/langchaindb	duplicate	Pass-through to a competing framework abstraction; get_supported_search_types() returns [] so it cannot join the merged hybrid/rerank pipeline.
+brain	libs/agno/agno/vectordb/llamaindex	duplicate	Same as langchaindb.
+brain	libs/agno/agno/db/gcs_json	duplicate	JSON-blob-in-a-bucket with no query/index capability; db/json/ covers dev use.
+brain	libs/agno/agno/knowledge/embedder/fireworks.py	duplicate	13-22 line class X(OpenAIEmbedder) shim differing only in base_url/id/env var.
+brain	libs/agno/agno/knowledge/embedder/nebius.py	duplicate	Same shim pattern.
+brain	libs/agno/agno/knowledge/embedder/together.py	duplicate	Same shim pattern.
+brain	libs/agno/agno/knowledge/embedder/langdb.py	duplicate	Same shim pattern.
+edge	extensions/memory-lancedb	duplicate	Vector-only (no FTS/MMR/decay/citations) and forks a THIRD memory tool surface against active-memory's allow-list; the brain LanceDB adapter already does hybrid on the same engine.
+
+# ---------------------------------------------------------------------------
+# DEFERRED — adjudicated as LOSERS, but NOT deletable as files in this session.
+# Each has live inbound imports from code that is being KEPT, so deleting the file
+# breaks the build. The capability verdict stands (see docs/DECISION-MATRIX.md);
+# retiring them requires a refactor of the consuming call sites, which is scoped
+# work beyond this merge. Recorded here rather than silently dropped or faked.
+# format: DEFERRED	plane	path	blocking-reason
+# ---------------------------------------------------------------------------
+DEFERRED	brain	libs/agno/agno/memory/strategies	5 inbound production imports (memory/__init__.py, memory/manager.py, os/routers/memory/memory.py). The edge dreaming consolidation wins on BEHAVIOUR; swapping it means reworking MemoryManager, not deleting a package.
+DEFERRED	brain	libs/agno/agno/scheduler/cron.py	11 inbound production imports (scheduler/manager.py, executor.py, os/routers/schedules/router.py, tools/studio.py). The edge cron wins on SEMANTICS (DST/jitter); replacing this is a refactor of the schedule engine, not a file deletion.
+DEFERRED	brain	libs/agno/agno/tracing/exporter.py	2 inbound production imports. The OTLP exporter wins, but DatabaseSpanExporter is still wired into the tracing bootstrap; removal follows the exporter swap.
+DEFERRED	brain	libs/agno/agno/os/middleware/trailing_slash.py	2 inbound production imports. Removable only once the gateway fully owns the edge and the REST facade stops self-mounting.
+DEFERRED	brain	libs/agno/agno/agent/remote.py	6 inbound production imports. ACP supersedes it as a PROTOCOL; cutting the Python proxy requires rewiring callers to ACP first.
+DEFERRED	brain	libs/agno/agno/team/remote.py	6 inbound production imports. Same as agent/remote.py.
+DEFERRED	brain	libs/agno/agno/workflow/remote.py	6 inbound production imports. Same as agent/remote.py.
+DEFERRED	brain	libs/agno/agno/debug.py	RETAINED AFTER REVIEW: an 18-line log-level shim, but `enable_debug_mode` is imported by many integration tests for subsystems being KEPT (e.g. db/surrealdb). Deleting it cost 6+ valuable test files as collateral. The saving is trivial; the coverage loss is not. Fold into edge logging later via a shim, do not delete.
+DEFERRED	brain	libs/agno/agno/client/os.py	HAS A LIVE CONSUMER: agno/remote/base.py:460 lazily calls `from agno.client import AgentOSClient` inside get_os_client(). Caught by the executed test suite, NOT by static grep (the import names the package, not the deleted submodule). Verdict stands - the edge gateway-protocol should generate this client - but removal must follow rewiring agno/remote/ first.
+DEFERRED	edge	src/system-agent/delegation-session.ts	HAS A LIVE CONSUMER: src/gateway/server-methods/system-agent-session-owner.ts:1 imports resolveSystemAgentDelegationKey from it. Folding it into a merged session-key module is a refactor, not a deletion.
+DEFERRED	edge	src/transcripts/summary.ts	HAS PRODUCTION CONSUMERS: store.ts, store-sqlite.ts, infra/state-migrations.meeting-transcripts-files.ts and summary-model.ts ITSELF import the shared TranscriptsSummary type and renderTranscriptsMarkdown from it. The verdict targeted the heuristic summarizeTranscripts() function, not the module; replacing that function is a refactor, not a file deletion.

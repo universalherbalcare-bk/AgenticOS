@@ -1,0 +1,61 @@
+# Local enforcement, before a commit can land. CI is the backstop, not the
+# only gate — a merge this large regresses fastest at the boundary, so the
+# deletion-integrity and contract-parity checks run on every commit.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+        exclude: ^planes/edge/
+      - id: check-json
+        exclude: ^planes/
+      - id: end-of-file-fixer
+        exclude: ^planes/
+      - id: trailing-whitespace
+        exclude: ^planes/
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: agenticos-ledger-matches-tree
+        name: deletion ledger matches the tree (deleted absent, deferred present)
+        # stdlib-only, so the system interpreter is fine here (unlike the
+        # import-integrity gate below, which needs agno's dependencies).
+        entry: python3 scripts/check-deletion-ledger.py
+        language: system
+        pass_filenames: false
+        files: ^(planes/|docs/deletions\.tsv)
+
+      - id: agenticos-deletion-integrity
+        name: deletion ledger has no dangling refs and every survivor imports
+        # Must resolve an interpreter that can import agno; the gate refuses
+        # otherwise rather than passing vacuously.
+        entry: scripts/hook-deletion-integrity.sh
+        language: script
+        pass_filenames: false
+        files: ^(planes/brain/|docs/deletions\.tsv)
+
+      - id: agenticos-ts-contract-parity
+        name: TypeScript contract matches the canonical JSON Schema
+        entry: bash -c 'node --test bridge/ts/src/contract.parity.test.ts'
+        language: system
+        pass_filenames: false
+        files: ^(bridge/)
+
+      - id: agenticos-contract-parity
+        name: bridge JSON Schema and Python models have not drifted
+        # Resolve an interpreter that actually has the test deps. A bare
+        # `python3` picks up the system interpreter, which has no pytest — the
+        # hook then fails for the wrong reason and teaches people to skip it.
+        entry: scripts/hook-contract-parity.sh
+        language: script
+        pass_filenames: false
+        files: ^(bridge/|tests/e2e/)
