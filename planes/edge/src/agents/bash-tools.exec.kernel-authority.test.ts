@@ -21,7 +21,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
 import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
-import { resetKernelAuthorityPendingForTests } from "./bash-tools.exec-kernel-authority-gate.js";
+import {
+  composeExecBeforeSpawn,
+  createExecKernelAuthorityGate,
+  getKernelAuthorityPendingSizeForTests,
+  kernelAuthorityPendingPartition,
+  resetKernelAuthorityPendingForTests,
+} from "./bash-tools.exec-kernel-authority-gate.js";
 
 const describeUnix = process.platform === "win32" ? describe.skip : describe;
 
@@ -404,5 +410,168 @@ describeUnix("exec tool kernel authority gate", () => {
     expect(spawnSpy).toHaveBeenCalledTimes(1);
     expect(result.details.status).toBe("completed");
     expect(fs.existsSync(fixture.requestFile)).toBe(false);
+  });
+
+  describe("C4: pending memory is partitioned by principal and session, TTL-bounded", () => {
+    const victimIdentity = {
+      messageProvider: "slack",
+      accountId: "acct-v",
+      channelContext: { sender: { id: "victim" }, chat: { id: "chan-v" } },
+      sessionKey: "agent:main:victim",
+    };
+    const attackerIdentity = {
+      messageProvider: "slack",
+      accountId: "acct-a",
+      channelContext: { sender: { id: "attacker" }, chat: { id: "chan-a" } },
+      sessionKey: "agent:main:attacker",
+    };
+
+    function sentApprovalId(fixture: ShimFixture): unknown {
+      return JSON.parse(fs.readFileSync(fixture.requestFile, "utf8")).approval_id;
+    }
+
+    it("the literal PoC: 256 distinct fillers from the SAME principal no longer evict the victim's remembered id", async () => {
+      const fixture = withShim();
+      setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+      setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+      setTestEnvValue("FAKE_AUTHORITY_MODE", "approval_required");
+      setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+
+      const tool = createExecTool(victimIdentity);
+      const victim = await tool.execute("victim-call", { command: "echo VICTIM-COMMAND-1" });
+      expect(victim.details).toMatchObject({ status: "approval-pending", approvalId: APPROVAL_ID });
+      expect(sentApprovalId(fixture)).toBeUndefined();
+
+      for (let i = 0; i < 256; i += 1) {
+        const filler = await tool.execute(`filler-${i}`, { command: `echo FILLER-${i}` });
+        expect(filler.details.status).toBe("approval-pending");
+      }
+
+      const retry = await tool.execute("victim-retry", { command: "echo VICTIM-COMMAND-1" });
+      expect(retry.details).toMatchObject({ status: "approval-pending", approvalId: APPROVAL_ID });
+      expect(sentApprovalId(fixture)).toBe(APPROVAL_ID);
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
+    it("a different principal flooding 300 distinct requests cannot evict the victim's remembered id", async () => {
+      const fixture = withShim();
+      setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+      setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+      setTestEnvValue("FAKE_AUTHORITY_MODE", "approval_required");
+      setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+
+      const victimTool = createExecTool(victimIdentity);
+      const attackerTool = createExecTool(attackerIdentity);
+      await victimTool.execute("victim-call", { command: "echo VICTIM-COMMAND-2" });
+      expect(sentApprovalId(fixture)).toBeUndefined();
+
+      for (let i = 0; i < 300; i += 1) {
+        await attackerTool.execute(`attacker-${i}`, { command: `echo ATTACK-${i}` });
+      }
+
+      await victimTool.execute("victim-retry", { command: "echo VICTIM-COMMAND-2" });
+      expect(sentApprovalId(fixture)).toBe(APPROVAL_ID);
+      // The attacker's partition is bounded on its own; the victim's single entry is untouched.
+      const victimPartition = kernelAuthorityPendingPartition(
+        { user_id: "victim", channel: "slack", channel_user: "chan-v" },
+        "agent:main:victim",
+      );
+      expect(getKernelAuthorityPendingSizeForTests(victimPartition)).toBe(1);
+      expect(getKernelAuthorityPendingSizeForTests()).toBe(301);
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
+    it("the same principal in a different session is a different partition: a cross-session retry proposes afresh (documented fail-safe cost)", async () => {
+      const fixture = withShim();
+      setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+      setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+      setTestEnvValue("FAKE_AUTHORITY_MODE", "approval_required");
+      setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+
+      const sessionA = createExecTool(victimIdentity);
+      const sessionB = createExecTool({ ...victimIdentity, sessionKey: "agent:main:other" });
+      await sessionA.execute("a-1", { command: "echo SESSION-BOUND" });
+      await sessionB.execute("b-1", { command: "echo SESSION-BOUND" });
+      expect(sentApprovalId(fixture)).toBeUndefined();
+      await sessionA.execute("a-2", { command: "echo SESSION-BOUND" });
+      expect(sentApprovalId(fixture)).toBe(APPROVAL_ID);
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("C2: the gate binds the kernel request to the spawn input it is invoked with", () => {
+    it("args.command/cwd/argv and the result text follow the spawn input, not the construction-time command", async () => {
+      const fixture = withShim();
+      setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+      setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+      setTestEnvValue("FAKE_AUTHORITY_MODE", "deny");
+      setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+
+      const gate = createExecKernelAuthorityGate({
+        command: "echo typed",
+        cwd: "/typed",
+        host: "gateway",
+        elevated: false,
+      });
+      expect(gate).toBeDefined();
+      const denied = await gate?.({
+        command: "/bin/echo rewritten",
+        cwd: "/spawn",
+        argv: ["/bin/echo", "rewritten"],
+      });
+      const sent = JSON.parse(fs.readFileSync(fixture.requestFile, "utf8"));
+      expect(sent.args).toEqual({
+        command: "/bin/echo rewritten",
+        cwd: "/spawn",
+        host: "gateway",
+        argv: ["/bin/echo", "rewritten"],
+      });
+      const text = denied?.content.map((c) => ("text" in c ? c.text : "")).join("\n") ?? "";
+      expect(text).toContain("/bin/echo rewritten");
+      expect(text).not.toContain("echo typed");
+      expect(denied?.details).toMatchObject({
+        status: "failed",
+        reason: "policy-denied",
+        cwd: "/spawn",
+      });
+    });
+
+    it("composeExecBeforeSpawn hands the same spawn input to both sides", async () => {
+      const seen: unknown[] = [];
+      const composed = composeExecBeforeSpawn(
+        async (spawn) => {
+          seen.push(spawn);
+          return undefined;
+        },
+        async (spawn) => {
+          seen.push(spawn);
+          return undefined;
+        },
+      );
+      await composed?.({ command: "x", cwd: "/w" });
+      expect(seen).toEqual([
+        { command: "x", cwd: "/w" },
+        { command: "x", cwd: "/w" },
+      ]);
+    });
+
+    it("gate invoked without a spawn input falls back to the construction-time command", async () => {
+      const fixture = withShim();
+      setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+      setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
+      setTestEnvValue("FAKE_AUTHORITY_MODE", "allow");
+      setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+
+      const gate = createExecKernelAuthorityGate({
+        command: "echo typed",
+        cwd: "/typed",
+        host: "sandbox",
+        elevated: true,
+      });
+      expect(await gate?.()).toBeUndefined();
+      const sent = JSON.parse(fs.readFileSync(fixture.requestFile, "utf8"));
+      expect(sent.args).toEqual({ command: "echo typed", cwd: "/typed", host: "sandbox" });
+      expect(sent.risk).toBe("R4");
+    });
   });
 });

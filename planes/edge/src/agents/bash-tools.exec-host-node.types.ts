@@ -5,6 +5,7 @@
  */
 import type { ExecAsk, ExecSecurity } from "../infra/exec-approvals.js";
 import type { ExecAutoReviewer } from "../infra/exec-auto-review.js";
+import type { ExecBeforeSpawnGate } from "./bash-tools.exec-kernel-authority-gate.js";
 import type { ExecElevatedDefaults } from "./bash-tools.exec-types.js";
 
 /** Full parameter bundle for Node-hosted exec command execution. */
@@ -49,4 +50,11 @@ export type ExecuteNodeHostCommandParams = {
   notifySessionKey?: string;
   notifyOnExit?: boolean;
   trustedSafeBinDirs?: ReadonlySet<string>;
+  /**
+   * APEX kernel authority gate built by the exec tool for this call; consulted immediately
+   * before every `system.run` dispatch. When absent, the node host resolves one itself from
+   * the environment (see bash-tools.exec-host-node-kernel-authority.ts), so a direct caller
+   * is gated exactly like the tool path.
+   */
+  kernelAuthorityGate?: ExecBeforeSpawnGate;
 };

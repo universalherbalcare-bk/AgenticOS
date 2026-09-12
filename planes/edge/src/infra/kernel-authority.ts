@@ -110,10 +110,15 @@ export type KernelAuthorityConfig = {
   directory: string | undefined;
   mode: KernelAuthorityMode;
   timeoutMs: number;
+  /** Ceiling on concurrently running authority processes (APEX_AUTHORITY_MAX_CONCURRENCY). */
+  maxConcurrency: number;
 };
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_STDOUT_BYTES = 256 * 1024;
+export const DEFAULT_AUTHORITY_MAX_CONCURRENCY = 8;
+/** Hard upper bound for APEX_AUTHORITY_MAX_CONCURRENCY; larger values fall back to the default. */
+export const AUTHORITY_MAX_CONCURRENCY_CEILING = 256;
 
 function normalizeNonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -131,9 +136,28 @@ function parsePositiveTimeoutMs(value: string | undefined): number | undefined {
 }
 
 /**
+ * Positive integer in [1, AUTHORITY_MAX_CONCURRENCY_CEILING], or undefined for anything else
+ * (absent, blank, non-integer, zero, negative, or above the ceiling). Invalid values never
+ * widen the ceiling: they fall back to the default.
+ */
+function parseMaxConcurrency(value: string | undefined): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || !/^[0-9]+$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= AUTHORITY_MAX_CONCURRENCY_CEILING
+    ? parsed
+    : undefined;
+}
+
+/**
  * Reads APEX_AUTHORITY_CMD / APEX_AUTHORITY_DIR / APEX_AUTHORITY_MODE from
  * `env`. APEX_AUTHORITY_TIMEOUT_MS is an undocumented test/ops escape hatch
  * for the 5000ms default; the protocol only specifies the default value.
+ * APEX_AUTHORITY_MAX_CONCURRENCY bounds how many authority processes this
+ * plane runs at once (default 8); callers beyond it wait, and the timeout
+ * covers wait + run so a saturated kernel fails closed instead of hanging.
  */
 export function resolveKernelAuthorityConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -143,7 +167,55 @@ export function resolveKernelAuthorityConfig(
   const mode: KernelAuthorityMode =
     normalizeNonEmpty(env.APEX_AUTHORITY_MODE) === "required" ? "required" : "native";
   const timeoutMs = parsePositiveTimeoutMs(env.APEX_AUTHORITY_TIMEOUT_MS) ?? DEFAULT_TIMEOUT_MS;
-  return { cmd, directory, mode, timeoutMs };
+  const maxConcurrency =
+    parseMaxConcurrency(env.APEX_AUTHORITY_MAX_CONCURRENCY) ?? DEFAULT_AUTHORITY_MAX_CONCURRENCY;
+  return { cmd, directory, mode, timeoutMs, maxConcurrency };
+}
+
+/** One startup-log line describing the resolved kernel authority mode. Pure; never logs itself. */
+export type KernelAuthorityModeDescription = {
+  mode: KernelAuthorityMode;
+  /** "warn" whenever the kernel is NOT (or cannot be) governing exec on this plane. */
+  level: "info" | "warn";
+  message: string;
+};
+
+/**
+ * Describes the resolved kernel authority mode for the gateway boot log, so a
+ * silent default to "native" (kernel not governing exec) is never invisible.
+ * Names only the authority command path and directory, never a gated command.
+ */
+export function describeKernelAuthorityMode(
+  env: NodeJS.ProcessEnv = process.env,
+): KernelAuthorityModeDescription {
+  const config = resolveKernelAuthorityConfig(env);
+  const settings = `dir=${config.directory ?? "(default)"} timeoutMs=${config.timeoutMs} maxConcurrency=${config.maxConcurrency}`;
+  if (config.mode === "required") {
+    if (!config.cmd) {
+      return {
+        mode: "required",
+        level: "warn",
+        message: `kernel authority: mode=required but APEX_AUTHORITY_CMD is unset; every exec spawn will be DENIED (kernel_unreachable) until it is set. ${settings}`,
+      };
+    }
+    return {
+      mode: "required",
+      level: "info",
+      message: `kernel authority: mode=required cmd=${config.cmd} ${settings}; the APEX kernel governs every exec spawn (gateway, sandbox, node hosts)`,
+    };
+  }
+  const rawMode = normalizeNonEmpty(env.APEX_AUTHORITY_MODE);
+  const why =
+    rawMode === undefined
+      ? "APEX_AUTHORITY_MODE is unset"
+      : rawMode === "native"
+        ? "APEX_AUTHORITY_MODE=native"
+        : `APEX_AUTHORITY_MODE=${JSON.stringify(rawMode)} is not "required"`;
+  return {
+    mode: "native",
+    level: "warn",
+    message: `WARNING kernel authority: mode=native (${why}); the APEX kernel is NOT governing exec on this plane, only plane-local approval policy applies. Set APEX_AUTHORITY_MODE=required and APEX_AUTHORITY_CMD to enable it.${config.cmd ? ` (APEX_AUTHORITY_CMD=${config.cmd} is set but ignored in native mode)` : ""}`,
+  };
 }
 
 function describeError(error: unknown): string {
@@ -213,6 +285,65 @@ type AuthorityProcessResult = {
   stdout: string;
   error?: NodeExecFileError;
 };
+
+// ---------------------------------------------------------------------------
+// Bounded concurrency. Every decide/resolve/finish spawns one authority process; without a
+// ceiling a burst of exec calls (or a deliberate flood) forks an unbounded number of kernel
+// processes. Callers beyond the ceiling queue here. The queue is FIFO, the ceiling is read per
+// call from the config (so ops can tune it without a restart of this module's tests), and a
+// waiter that cannot get a slot before the caller's own timeout fails closed rather than hangs.
+// ---------------------------------------------------------------------------
+
+type AuthoritySlotWaiter = { grant: () => void };
+
+let authorityInFlight = 0;
+const authoritySlotWaiters: AuthoritySlotWaiter[] = [];
+
+/** Resolves true once a slot is held (the caller MUST release it), false if `waitMs` elapsed first. */
+function acquireAuthoritySlot(limit: number, waitMs: number): Promise<boolean> {
+  if (authorityInFlight < limit) {
+    authorityInFlight += 1;
+    return Promise.resolve(true);
+  }
+  return new Promise<boolean>((resolvePromise) => {
+    let settled = false;
+    const waiter: AuthoritySlotWaiter = {
+      grant: () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        authorityInFlight += 1;
+        resolvePromise(true);
+      },
+    };
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const index = authoritySlotWaiters.indexOf(waiter);
+      if (index >= 0) {
+        authoritySlotWaiters.splice(index, 1);
+      }
+      resolvePromise(false);
+    }, waitMs);
+    timer.unref?.();
+    authoritySlotWaiters.push(waiter);
+  });
+}
+
+function releaseAuthoritySlot(): void {
+  authorityInFlight = Math.max(0, authorityInFlight - 1);
+  const next = authoritySlotWaiters.shift();
+  next?.grant();
+}
+
+/** Test hook: how many authority processes this module believes are running right now. */
+export function getKernelAuthorityInFlightCountForTests(): number {
+  return authorityInFlight;
+}
 
 /** Spawns `cmd` with no shell and no arguments, writes `requestJson` to stdin, collects stdout. */
 function runAuthorityProcess(
@@ -315,7 +446,23 @@ async function invokeAuthority(
   // wants the authority process to see) without mutating global state.
   const childEnv: NodeJS.ProcessEnv =
     env === process.env ? process.env : { ...process.env, ...env };
-  const { stdout, error } = await runAuthorityProcess(cmd, requestJson, config.timeoutMs, childEnv);
+  // The configured timeout bounds wait + run together: time spent queued for a slot is
+  // subtracted from the process timeout, so a saturated kernel cannot stall a caller past it.
+  const startedAt = Date.now();
+  const granted = await acquireAuthoritySlot(config.maxConcurrency, config.timeoutMs);
+  if (!granted) {
+    return unreachable(
+      `kernel authority concurrency ceiling (${config.maxConcurrency}) stayed saturated for ${config.timeoutMs}ms`,
+    );
+  }
+  let stdout: string;
+  let error: NodeExecFileError | undefined;
+  try {
+    const remainingMs = Math.max(1, config.timeoutMs - (Date.now() - startedAt));
+    ({ stdout, error } = await runAuthorityProcess(cmd, requestJson, remainingMs, childEnv));
+  } finally {
+    releaseAuthoritySlot();
+  }
 
   let parsed: unknown;
   try {

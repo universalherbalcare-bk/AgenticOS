@@ -451,11 +451,23 @@ export function createExecTool(
           warnings,
         });
 
+        // No-op unless APEX_AUTHORITY_MODE=required. Built BEFORE host dispatch so every host
+        // (gateway, sandbox, node) is governed; local hosts compose it into beforeSpawn below,
+        // the node host consults it right before each system.run dispatch.
+        const kernelAuthorityGate = createExecKernelAuthorityGate({
+          command: params.command,
+          ...(workdir ? { cwd: workdir } : {}),
+          host,
+          elevated: elevatedRequested,
+          identity: defaults,
+        });
+
         if (host === "node") {
           return executeNodeHostCommand({
             command: params.command,
             toolCallId,
             workdir,
+            kernelAuthorityGate,
             env,
             requestedEnv,
             requestedNode: params.node?.trim(),
@@ -497,15 +509,6 @@ export function createExecTool(
         if (!workdir) {
           throw new Error("exec internal error: local execution requires a resolved workdir");
         }
-
-        // No-op unless APEX_AUTHORITY_MODE=required; composed into beforeSpawn below.
-        const kernelAuthorityGate = createExecKernelAuthorityGate({
-          command: params.command,
-          cwd: workdir,
-          host,
-          elevated: elevatedRequested,
-          identity: defaults,
-        });
 
         const githubProfileDir =
           host === "gateway" && preparedRunEnvironment.managedLocalIdentity

@@ -7,6 +7,7 @@ import {
 } from "../config/io.js";
 import { isNixMode } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { describeKernelAuthorityMode } from "../infra/kernel-authority.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
@@ -350,6 +351,14 @@ export async function finishGatewayStartup(params: {
   kernel.setPostAttachHandles(postAttachHandles, startupPluginRuntimeClaim);
   startupTrace.detail("memory.ready", collectGatewayProcessMemoryUsageMb());
   startupTrace.mark("ready");
+  // One unmistakable line per boot: a silent default to "native" (kernel not governing exec)
+  // must never be invisible in the gateway log (red-team finding C7).
+  const kernelAuthority = describeKernelAuthorityMode(process.env);
+  if (kernelAuthority.level === "warn") {
+    log.warn(kernelAuthority.message);
+  } else {
+    log.info(kernelAuthority.message);
+  }
   if (sidecarStartup === "defer") {
     log.info("gateway ready");
   }

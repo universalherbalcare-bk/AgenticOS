@@ -46,6 +46,7 @@ import {
   recordNotifyOnExitRemoval,
   tail,
 } from "./bash-process-registry.js";
+import type { ExecBeforeSpawnGate } from "./bash-tools.exec-kernel-authority-gate.js";
 import {
   appendExecTimeoutRetryGuidance,
   renderExecExitLabel,
@@ -691,8 +692,12 @@ export async function runExecProcess({
   onUpdate?: (partialResult: AgentToolResult<ExecToolDetails>) => void;
   /** Runs after process finalization and before the exit wake is queued. */
   onSettledBeforeNotify?: (outcome: ExecProcessOutcome) => void;
-  /** Revalidates authorization after async preparation, immediately before each spawn attempt. */
-  beforeSpawn?: () => Promise<AgentToolResult<ExecToolDetails> | undefined>;
+  /**
+   * Revalidates authorization after async preparation, immediately before each spawn attempt.
+   * Receives the command that is actually about to be spawned (`execCommand` when the host
+   * rewrote the request), so an authority can bind its decision to that exact string.
+   */
+  beforeSpawn?: ExecBeforeSpawnGate;
 }): Promise<ExecProcessHandle> {
   const startedAt = Date.now();
   const sessionId = createSessionSlug(isProcessSessionIdTaken);
@@ -946,7 +951,7 @@ export async function runExecProcess({
 
   const assertPreSpawnAuthorized = async () => {
     startupSignal?.throwIfAborted();
-    const denied = await beforeSpawn?.();
+    const denied = await beforeSpawn?.({ command: execCommand, cwd: opts.workdir });
     startupSignal?.throwIfAborted();
     if (denied) {
       throw new ExecProcessPreflightError(denied);

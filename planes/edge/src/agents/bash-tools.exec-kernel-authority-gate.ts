@@ -6,7 +6,14 @@
  * (see bash-tools.exec-runtime.ts): the one point, common to every local exec
  * host (gateway and sandbox), where a command has already cleared the
  * plane's own allow/deny/ask policy and is immediately about to be spawned
- * as a real OS process.
+ * as a real OS process. The node host (bash-tools.exec-host-node.ts) calls
+ * the same gate immediately before each `system.run` dispatch.
+ *
+ * The gate authorizes the command that is ACTUALLY spawned: `beforeSpawn`
+ * receives the final spawn parameters (the gateway host may rewrite the
+ * requested command, e.g. safe-bin path normalization) and the kernel
+ * request's `args.command` is bound to that string, never to the request
+ * as the model typed it (red-team finding C2).
  *
  * Mode "native" (the default, and any mode when APEX_AUTHORITY_CMD is
  * unset) leaves existing plane approval behaviour completely unchanged:
@@ -25,19 +32,20 @@ import {
   type AuthorityPrincipal,
   type AuthorityRisk,
 } from "../infra/kernel-authority.js";
+import {
+  createKernelAuthorityPendingMemory,
+  type KernelAuthorityPendingMemory,
+} from "./bash-tools.exec-kernel-authority-pending.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { AgentToolResult } from "./runtime/index.js";
 
 // ---------------------------------------------------------------------------
-// Pending approval memory. Without it every exec attempt would propose a NEW kernel record
-// and the human's approval of the previous one could never be consumed: the command would be
-// re-requested forever. With it, the retry after the human says yes presents the remembered
-// id, the kernel consumes it atomically, and the command is spawned exactly once. Bounded and
-// in-memory: a lost entry costs one extra approval round, never an unapproved spawn.
+// Pending approval memory: see bash-tools.exec-kernel-authority-pending.ts. Partitioned by
+// principal (+ session), TTL-bounded, with an overall cap that evicts the flooding partition
+// first. A lost entry costs one extra approval round, never an unapproved spawn.
 // ---------------------------------------------------------------------------
 
-const PENDING_MEMORY_MAX = 256;
-const pendingApprovals = new Map<string, string>();
+const pendingApprovals: KernelAuthorityPendingMemory = createKernelAuthorityPendingMemory();
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
@@ -58,21 +66,27 @@ export function kernelAuthorityRequestKey(request: AuthorityDecideRequest): stri
   return canonicalJson({ plane, tool, risk, principal, args });
 }
 
-function rememberPending(key: string, id: string): void {
-  pendingApprovals.delete(key);
-  pendingApprovals.set(key, id);
-  while (pendingApprovals.size > PENDING_MEMORY_MAX) {
-    const oldest = pendingApprovals.keys().next().value;
-    if (oldest === undefined) {
-      break;
-    }
-    pendingApprovals.delete(oldest);
-  }
+/**
+ * Pending-memory partition: the resolved kernel principal plus the agent session when known.
+ * Exported so tests can assert two callers land in different partitions.
+ */
+export function kernelAuthorityPendingPartition(
+  principal: AuthorityPrincipal,
+  sessionKey: string | undefined,
+): string {
+  return canonicalJson({ principal, session: sessionKey?.trim() || null });
 }
 
 /** Test hook: forget every remembered approval id. */
 export function resetKernelAuthorityPendingForTests(): void {
   pendingApprovals.clear();
+}
+
+/** Test hook: live remembered-id count (all partitions, or one). */
+export function getKernelAuthorityPendingSizeForTests(partition?: string): number {
+  return partition === undefined
+    ? pendingApprovals.size()
+    : pendingApprovals.partitionSize(partition);
 }
 
 export type InterpretedKernelDecision =
@@ -148,6 +162,15 @@ function resolveKernelAuthorityPrincipal(
   return { user_id: os.userInfo().username, channel: "edge" };
 }
 
+/** Marks tool results produced by this gate so hosts can tell them from their own outcomes. */
+export const KERNEL_AUTHORITY_RESULT_KIND = {
+  denied: "kernel-denied",
+  pending: "kernel-approval-pending",
+} as const;
+
+export type KernelAuthorityResultKind =
+  (typeof KERNEL_AUTHORITY_RESULT_KIND)[keyof typeof KERNEL_AUTHORITY_RESULT_KIND];
+
 function buildKernelDeniedResult(params: {
   command: string;
   cwd?: string;
@@ -168,6 +191,26 @@ function buildKernelDeniedResult(params: {
       ...(params.cwd ? { cwd: params.cwd } : {}),
     },
   };
+}
+
+/** Which gate outcome a result carries, by the shape this module alone produces. */
+export function classifyKernelAuthorityResult(
+  result: AgentToolResult<ExecToolDetails> | undefined,
+): KernelAuthorityResultKind | undefined {
+  if (!result) {
+    return undefined;
+  }
+  if (result.details.status === "approval-pending") {
+    return typeof result.details.approvalSlug === "string" &&
+      result.details.approvalSlug.startsWith("kernel:")
+      ? KERNEL_AUTHORITY_RESULT_KIND.pending
+      : undefined;
+  }
+  if (result.details.status === "failed" && result.details.reason === "policy-denied") {
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("\n");
+    return text.startsWith("Exec denied (kernel") ? KERNEL_AUTHORITY_RESULT_KIND.denied : undefined;
+  }
+  return undefined;
 }
 
 function buildKernelApprovalPendingResult(params: {
@@ -208,6 +251,8 @@ export type ExecKernelAuthorityIdentitySource = {
   accountId?: string;
   messageProvider?: string;
   currentChannelId?: string;
+  /** Agent session; partitions pending-approval memory, never sent to the kernel. */
+  sessionKey?: string;
 };
 
 function principalSourceFromIdentity(
@@ -221,6 +266,7 @@ function principalSourceFromIdentity(
 }
 
 export type CreateExecKernelAuthorityGateParams = {
+  /** The command as requested. Overridden per call by the spawn input when the host rewrites it. */
   command: string;
   cwd?: string;
   host: ExecHost;
@@ -229,16 +275,36 @@ export type CreateExecKernelAuthorityGateParams = {
   principal?: ExecKernelAuthorityPrincipalSource;
   /** Convenience alternative to `principal`: the exec tool's own runtime defaults bag. */
   identity?: ExecKernelAuthorityIdentitySource;
+  /** Agent session for pending-memory partitioning when `principal` is given directly. */
+  sessionKey?: string;
   env?: NodeJS.ProcessEnv;
 };
 
-export type ExecBeforeSpawnGate = () => Promise<AgentToolResult<ExecToolDetails> | undefined>;
+/**
+ * What is actually about to be spawned. `runExecProcess` passes the final
+ * `execCommand` (after any host rewrite) and workdir; the node host passes the
+ * prepared transport command plus the exact argv the node will run.
+ */
+export type ExecSpawnAuthorizationInput = {
+  command: string;
+  cwd?: string;
+  argv?: readonly string[];
+};
+
+export type ExecBeforeSpawnGate = (
+  spawn?: ExecSpawnAuthorizationInput,
+) => Promise<AgentToolResult<ExecToolDetails> | undefined>;
 
 /**
  * Builds a `runExecProcess`-compatible `beforeSpawn` gate for one exec call,
  * or returns `undefined` when the kernel authority integration is inactive
  * (mode "native"). Reads configuration from the environment at call time
  * (each invocation re-resolves it), so tests can flip modes between runs.
+ *
+ * When invoked with a spawn input, the kernel is asked about THAT command
+ * (and argv, when given), and the returned result names it too; the
+ * `command` given at construction time is only the fallback for callers that
+ * spawn exactly what was requested.
  */
 export function createExecKernelAuthorityGate(
   params: CreateExecKernelAuthorityGateParams,
@@ -248,7 +314,9 @@ export function createExecKernelAuthorityGate(
   if (config.mode !== "required") {
     return undefined;
   }
-  return async () => {
+  return async (spawn) => {
+    const command = spawn?.command ?? params.command;
+    const cwd = spawn?.cwd ?? params.cwd;
     const risk: AuthorityRisk = params.elevated ? "R4" : "R3";
     const principal = resolveKernelAuthorityPrincipal(
       params.principal ?? principalSourceFromIdentity(params.identity),
@@ -259,35 +327,45 @@ export function createExecKernelAuthorityGate(
       risk,
       principal,
       args: {
-        command: params.command,
-        cwd: params.cwd ?? "",
+        command,
+        cwd: cwd ?? "",
         host: params.host,
+        ...(spawn?.argv ? { argv: [...spawn.argv] } : {}),
       },
     };
+    const partition = kernelAuthorityPendingPartition(
+      principal,
+      params.sessionKey ?? params.identity?.sessionKey,
+    );
     const key = kernelAuthorityRequestKey(request);
-    const remembered = pendingApprovals.get(key);
+    const remembered = pendingApprovals.recall(partition, key);
     const decision = await decideKernelAuthority(
       remembered === undefined ? request : { ...request, approval_id: remembered },
       env,
     );
     const interpreted = interpretKernelDecision(decision, remembered);
     if (interpreted.kind === "allow") {
-      pendingApprovals.delete(key);
+      pendingApprovals.forget(partition, key);
       return undefined;
     }
     if (interpreted.kind === "pending") {
-      rememberPending(key, interpreted.approvalId);
+      pendingApprovals.remember(
+        partition,
+        key,
+        interpreted.approvalId,
+        interpreted.decision.expires_at,
+      );
       return buildKernelApprovalPendingResult({
-        command: params.command,
-        ...(params.cwd ? { cwd: params.cwd } : {}),
+        command,
+        ...(cwd ? { cwd } : {}),
         host: params.host,
         decision: interpreted.decision,
       });
     }
-    pendingApprovals.delete(key);
+    pendingApprovals.forget(partition, key);
     return buildKernelDeniedResult({
-      command: params.command,
-      ...(params.cwd ? { cwd: params.cwd } : {}),
+      command,
+      ...(cwd ? { cwd } : {}),
       decision: interpreted.decision,
     });
   };
@@ -296,6 +374,7 @@ export function createExecKernelAuthorityGate(
 /**
  * Runs `first`, then `second` only if `first` allowed the spawn (returned
  * `undefined`). Either side may be absent; returns `undefined` when both are.
+ * The spawn input is handed to both sides unchanged.
  */
 export function composeExecBeforeSpawn(
   first: ExecBeforeSpawnGate | undefined,
@@ -307,11 +386,11 @@ export function composeExecBeforeSpawn(
   if (!second) {
     return first;
   }
-  return async () => {
-    const firstResult = await first();
+  return async (spawn) => {
+    const firstResult = await first(spawn);
     if (firstResult) {
       return firstResult;
     }
-    return second();
+    return second(spawn);
   };
 }

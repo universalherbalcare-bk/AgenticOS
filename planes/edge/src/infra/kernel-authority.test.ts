@@ -12,8 +12,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  AUTHORITY_MAX_CONCURRENCY_CEILING,
+  DEFAULT_AUTHORITY_MAX_CONCURRENCY,
   decide,
+  describeKernelAuthorityMode,
   finish,
+  getKernelAuthorityInFlightCountForTests,
   resolve,
   resolveKernelAuthorityConfig,
   type AuthorityDecideRequest,
@@ -114,13 +118,14 @@ function baseDecideRequest(
 }
 
 describeUnix("kernel-authority resolveKernelAuthorityConfig", () => {
-  it("defaults to native mode with no cmd/directory and the 5s timeout", () => {
+  it("defaults to native mode with no cmd/directory, the 5s timeout, and the concurrency ceiling of 8", () => {
     const config = resolveKernelAuthorityConfig({});
     expect(config).toEqual({
       cmd: undefined,
       directory: undefined,
       mode: "native",
       timeoutMs: 5000,
+      maxConcurrency: 8,
     });
   });
 
@@ -406,6 +411,166 @@ describeUnix("kernel-authority resolve() and finish()", () => {
       { APEX_AUTHORITY_CMD: shim, FAKE_AUTHORITY_MODE: "deny" },
     );
     expect(denied.ok).toBe(false);
+  });
+});
+
+describeUnix("kernel-authority startup mode description (C7)", () => {
+  it("native by default: a WARNING that the kernel is not governing exec, naming the unset variable", () => {
+    const described = describeKernelAuthorityMode({});
+    expect(described.mode).toBe("native");
+    expect(described.level).toBe("warn");
+    expect(described.message).toMatch(/^WARNING kernel authority: mode=native/);
+    expect(described.message).toContain("APEX_AUTHORITY_MODE is unset");
+    expect(described.message).toContain("NOT governing exec");
+  });
+
+  it("native with a cmd set but mode wrong: still a WARNING, and it names both facts", () => {
+    const described = describeKernelAuthorityMode({
+      APEX_AUTHORITY_MODE: "Required",
+      APEX_AUTHORITY_CMD: "/opt/apex/bin/apex-authority",
+    });
+    expect(described).toMatchObject({ mode: "native", level: "warn" });
+    expect(described.message).toContain('APEX_AUTHORITY_MODE="Required" is not "required"');
+    expect(described.message).toContain(
+      "APEX_AUTHORITY_CMD=/opt/apex/bin/apex-authority is set but ignored",
+    );
+  });
+
+  it("required with a cmd: an info line naming the command, dir, timeout and concurrency ceiling", () => {
+    const described = describeKernelAuthorityMode({
+      APEX_AUTHORITY_MODE: "required",
+      APEX_AUTHORITY_CMD: "/opt/apex/bin/apex-authority",
+      APEX_AUTHORITY_DIR: "/var/lib/apex",
+      APEX_AUTHORITY_TIMEOUT_MS: "2500",
+      APEX_AUTHORITY_MAX_CONCURRENCY: "3",
+    });
+    expect(described).toMatchObject({ mode: "required", level: "info" });
+    expect(described.message).toBe(
+      "kernel authority: mode=required cmd=/opt/apex/bin/apex-authority dir=/var/lib/apex timeoutMs=2500 maxConcurrency=3; the APEX kernel governs every exec spawn (gateway, sandbox, node hosts)",
+    );
+  });
+
+  it("required without a cmd: a WARNING that every exec will be denied until it is set", () => {
+    const described = describeKernelAuthorityMode({ APEX_AUTHORITY_MODE: "required" });
+    expect(described).toMatchObject({ mode: "required", level: "warn" });
+    expect(described.message).toContain("APEX_AUTHORITY_CMD is unset");
+    expect(described.message).toContain("DENIED");
+  });
+});
+
+describeUnix("kernel-authority bounded concurrency (C8)", () => {
+  const CONCURRENCY_SHIM = `#!/bin/sh
+set -eu
+cat >/dev/null
+mark="$FAKE_MARK_DIR/$$"
+: > "$mark"
+sleep "\${FAKE_SLEEP_S:-0.3}"
+count=$(ls "$FAKE_MARK_DIR" | wc -l | tr -d ' ')
+printf '%s\n' "$count" >> "$FAKE_MARK_DIR.log"
+rm -f "$mark"
+printf '%s\n' '{"ok":true,"result":{"decision":"allow","reason":"low_risk","operation":"tool.execute","resource":"exec:test","risk":"R3","approval_id":null}}'
+exit 0
+`;
+  let dir: string;
+  let markDir: string;
+  let shim: string;
+
+  beforeEach(() => {
+    dir = createShimDir();
+    markDir = path.join(dir, "marks");
+    fs.mkdirSync(markDir);
+    shim = path.join(dir, "apex-authority-slow");
+    fs.writeFileSync(shim, CONCURRENCY_SHIM, { mode: 0o755 });
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("parses APEX_AUTHORITY_MAX_CONCURRENCY and falls back to the default on anything invalid", () => {
+    expect(DEFAULT_AUTHORITY_MAX_CONCURRENCY).toBe(8);
+    expect(resolveKernelAuthorityConfig({}).maxConcurrency).toBe(8);
+    expect(
+      resolveKernelAuthorityConfig({ APEX_AUTHORITY_MAX_CONCURRENCY: "4" }).maxConcurrency,
+    ).toBe(4);
+    expect(
+      resolveKernelAuthorityConfig({ APEX_AUTHORITY_MAX_CONCURRENCY: " 1 " }).maxConcurrency,
+    ).toBe(1);
+    expect(
+      resolveKernelAuthorityConfig({
+        APEX_AUTHORITY_MAX_CONCURRENCY: String(AUTHORITY_MAX_CONCURRENCY_CEILING),
+      }).maxConcurrency,
+    ).toBe(AUTHORITY_MAX_CONCURRENCY_CEILING);
+    for (const invalid of ["0", "-1", "1.5", "abc", "", "  ", "1e3", "0x10", "99999"]) {
+      expect(
+        resolveKernelAuthorityConfig({ APEX_AUTHORITY_MAX_CONCURRENCY: invalid }).maxConcurrency,
+      ).toBe(8);
+    }
+  });
+
+  it("20 concurrent decides never exceed the ceiling in flight, and all complete with the kernel's answer", async () => {
+    const env = {
+      APEX_AUTHORITY_CMD: shim,
+      APEX_AUTHORITY_MODE: "required",
+      APEX_AUTHORITY_TIMEOUT_MS: "20000",
+      APEX_AUTHORITY_MAX_CONCURRENCY: "4",
+      FAKE_MARK_DIR: markDir,
+      FAKE_SLEEP_S: "0.2",
+    };
+    const decisions = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        decide(
+          baseDecideRequest({ args: { command: `echo ${i}`, cwd: "/work", host: "gateway" } }),
+          env,
+        ),
+      ),
+    );
+    expect(decisions.map((d) => d.decision)).toEqual(Array.from({ length: 20 }, () => "allow"));
+    const observed = fs
+      .readFileSync(`${markDir}.log`, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => Number(line));
+    expect(observed).toHaveLength(20);
+    expect(Math.max(...observed)).toBeLessThanOrEqual(4);
+    // The ceiling was actually reached (the runs were genuinely concurrent, not serialized by chance).
+    expect(Math.max(...observed)).toBeGreaterThanOrEqual(2);
+    expect(getKernelAuthorityInFlightCountForTests()).toBe(0);
+  });
+
+  it("callers stuck behind a saturated ceiling fail closed within the timeout instead of hanging", async () => {
+    const env = {
+      APEX_AUTHORITY_CMD: shim,
+      APEX_AUTHORITY_MODE: "required",
+      APEX_AUTHORITY_TIMEOUT_MS: "300",
+      APEX_AUTHORITY_MAX_CONCURRENCY: "1",
+      FAKE_MARK_DIR: markDir,
+      FAKE_SLEEP_S: "5",
+    };
+    const startedAt = Date.now();
+    const decisions = await Promise.all(
+      Array.from({ length: 3 }, (_, i) =>
+        decide(
+          baseDecideRequest({ args: { command: `echo ${i}`, cwd: "/work", host: "gateway" } }),
+          env,
+        ),
+      ),
+    );
+    const elapsedMs = Date.now() - startedAt;
+    for (const decision of decisions) {
+      expect(decision.decision).toBe("deny");
+      expect(decision.reason).toBe("kernel_unreachable");
+    }
+    // Well under the 5s the shim would sleep: every caller was bounded by the 300ms budget.
+    expect(elapsedMs).toBeLessThan(3000);
+    expect(getKernelAuthorityInFlightCountForTests()).toBe(0);
+    // A later call is not poisoned by the earlier saturation.
+    const after = await decide(baseDecideRequest(), {
+      ...env,
+      FAKE_SLEEP_S: "0",
+      APEX_AUTHORITY_TIMEOUT_MS: "5000",
+    });
+    expect(after.decision).toBe("allow");
   });
 });
 
