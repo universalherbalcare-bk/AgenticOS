@@ -30,9 +30,15 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ env.PYTHON_VERSION }}" }
       - name: Install brain plane
+        # The same dependency set the brain job installs. With only the bare package,
+        # scripts_audit_dangling_refs.py reports 81/193 packages importable; with this
+        # set it reports the 149/193 the Phase 0 baseline records. The gate's invariant
+        # (zero dangling imports, more than zero packages importable) holds either way,
+        # but the number this job prints should be the one the baseline cites.
         run: |
           python -m pip install --upgrade pip
           pip install -e planes/brain/libs/agno
+          pip install pytest pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator
       - name: Deletion ledger matches the tree
         run: python scripts/check-deletion-ledger.py
       # Runs on the job interpreter, which installed the brain plane above. The

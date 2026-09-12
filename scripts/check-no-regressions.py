@@ -40,6 +40,8 @@ BASELINE = ROOT / "tests" / "known-failing-baseline.txt"
 ERROR_BASELINE = ROOT / "tests" / "known-erroring-baseline.txt"
 FAILED_RE = re.compile(r"^FAILED (\S+)")
 ERROR_RE = re.compile(r"^ERROR (\S+)")
+# pytest prints "= 232 failed, 12616 passed, 509 skipped, 312 errors in 363.00s ="
+SUMMARY_RE = re.compile(r"=+ .*\b\d+ (?:passed|failed|error|errors|skipped|deselected)\b.* in [0-9.]+s(?: \([^)]*\))? =+")
 
 
 def main(argv: list[str]) -> int:
@@ -63,9 +65,34 @@ def main(argv: list[str]) -> int:
             return 2
 
     lines = output.read_text(errors="ignore").splitlines()
-    if not any(line.startswith("ERROR ") or line.startswith("FAILED ") for line in lines) \
-            and not any("passed" in line and "==" in line for line in lines):
-        print("pytest output has no short summary; run pytest with -rfE", file=sys.stderr)
+
+    # The short summary (-r) is what we parse; the final "= N failed, M errors in ... ="
+    # line is printed regardless of -r flags. Cross-check them: if the totals say errors
+    # or failures happened but no matching summary lines were printed, the run was made
+    # without -rfE and the comparison below would be silently vacuous. A first version
+    # of this guard only refused when NO summary lines existed at all, so a run with
+    # failures present but ERROR lines suppressed sailed through reporting "0 erroring"
+    # and "312 no longer erroring" -- exactly the shape of the real brain suite.
+    totals = None
+    for line in reversed(lines):
+        m = SUMMARY_RE.search(line)
+        if m:
+            totals = m.group(0)
+            break
+    if totals is None:
+        print("pytest output has no final summary line; run pytest to completion with -rfE",
+              file=sys.stderr)
+        return 2
+    counted = {kind: int(n) for n, kind in re.findall(r"(\d+) (failed|error)", totals)}
+    parsed_failed = sum(1 for line in lines if FAILED_RE.match(line))
+    parsed_error = sum(1 for line in lines if ERROR_RE.match(line))
+    if counted.get("failed", 0) and not parsed_failed:
+        print(f"summary reports {counted['failed']} failed but no FAILED lines were printed; "
+              "run pytest with -rfE", file=sys.stderr)
+        return 2
+    if counted.get("error", 0) and not parsed_error:
+        print(f"summary reports {counted['error']} errors but no ERROR lines were printed; "
+              "run pytest with -rfE", file=sys.stderr)
         return 2
 
     def load(path):
