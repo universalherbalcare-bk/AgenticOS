@@ -12,8 +12,6 @@ import {
   createChildDiagnosticTraceContext,
   freezeDiagnosticTraceContext,
 } from "../infra/diagnostic-trace-context.js";
-import { pruneMapToMaxSize } from "../infra/map-size.js";
-import { getPluginToolMeta } from "../plugins/tool-metadata.js";
 import { recordRunSkillUsage } from "../skills/runtime/run-usage.js";
 import { copyBeforeToolCallWrapperMetadata } from "./agent-tool-metadata.js";
 import {
@@ -44,14 +42,9 @@ import {
   runBeforeToolCallHook,
 } from "./agent-tools.before-tool-call.policy.js";
 import {
-  adjustedParamsByToolCallId,
-  buildAdjustedParamsKey,
   clearTrackedToolExecution,
-  preExecutionBlockedToolCallIds,
-  recordStructuredReplaySafeToolCall,
   recordToolExecutionStarted,
   recordToolExecutionTracked,
-  structuredReplaySafeToolCallIds,
 } from "./agent-tools.before-tool-call.state.js";
 import type {
   BeforeToolCallFailureDisposition,
@@ -60,6 +53,16 @@ import type {
   HookOutcome,
 } from "./agent-tools.before-tool-call.types.js";
 import {
+  BeforeToolCallFailureError,
+  buildBlockedToolResult,
+  finalizeBeforeToolCallExecutionParams,
+  prepareBeforeToolCallExecutionParams,
+  recordAdjustedParamsForToolCall,
+  getBeforeToolCallFailureDisposition,
+  recordPreExecutionBlockedToolCall,
+  tagBeforeToolCallFailure,
+} from "./agent-tools.before-tool-call.wrapper-support.js";
+import {
   createInternalExecutionPreparer,
   readInternalExecutionControl,
 } from "./agent-tools.execution-preparer.js";
@@ -67,6 +70,10 @@ import {
   readInternalToolExecutionValidation,
   validateToolExecutionParams,
 } from "./agent-tools.execution-validation.js";
+import {
+  authorityOutcomeFromToolResult,
+  runAgentToolKernelAuthorityGate,
+} from "./agent-tools.kernel-authority-gate.js";
 import {
   BEFORE_TOOL_CALL_DIAGNOSTIC_OPTIONS,
   BEFORE_TOOL_CALL_HOOK_CONTEXT,
@@ -78,11 +85,9 @@ import {
   getBeforeToolCallSourceTool,
   type BeforeToolCallDiagnosticOptions,
 } from "./before-tool-call-metadata.js";
-import { getChannelAgentToolMeta } from "./channel-tool-metadata.js";
 import {
   getCodeModeExecBeforeHookMetadata,
   normalizeCodeModeExecBeforeHookParams,
-  reconcileCodeModeExecBeforeHookParams,
 } from "./code-mode-control-tools.js";
 import {
   appendToolLoopWarning,
@@ -91,204 +96,27 @@ import {
 import { buildToolMutationState } from "./tool-mutation.js";
 import { normalizeToolPolicyName } from "./tool-policy.js";
 import {
-  formatToolExecutionErrorMessage,
   isTrustedToolExecutionPreflightError,
   protectNetworkToolExecutionError,
-  registerTrustedToolNoStartError,
 } from "./tool-result-error.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
+export {
+  buildBlockedToolResult,
+  finalizeBeforeToolCallExecutionParams,
+  getBeforeToolCallFailureDisposition,
+  isBeforeToolCallBlockedError,
+  isPreExecutionBlockedToolResult,
+  prepareBeforeToolCallExecutionParams,
+  recordAdjustedParamsForToolCall,
+  recordStructuredReplayTrustForToolCall,
+} from "./agent-tools.before-tool-call.wrapper-support.js";
+
 type ForwardedToolExecution = (...args: unknown[]) => ReturnType<AnyAgentTool["execute"]>;
-const MAX_TRACKED_ADJUSTED_PARAMS = 1024;
 const INTERNAL_DISPOSED_RESULT = {
   content: [],
   details: { status: "skipped", deniedReason: "internal-dispose" },
 };
-
-/** Run tool-owned preparation while retaining the exact prepared object. */
-export async function prepareBeforeToolCallExecutionParams(params: {
-  tool: AnyAgentTool;
-  params: unknown;
-  toolCallId?: string;
-  ctx?: HookContext;
-  signal?: AbortSignal;
-}): Promise<unknown> {
-  const prepare = params.tool.prepareBeforeToolCallParams;
-  return prepare
-    ? await prepare(params.params, {
-        ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
-        ...(params.ctx ? { hookContext: params.ctx } : {}),
-        ...(params.signal ? { signal: params.signal } : {}),
-      })
-    : params.params;
-}
-
-/** Reconcile hook rewrites and restore tool-owned state before execution. */
-export function finalizeBeforeToolCallExecutionParams(params: {
-  tool: AnyAgentTool;
-  preparedParams: unknown;
-  hookParams: unknown;
-  adjustedParams: unknown;
-  finalizerMode: "adapter" | "wrapped";
-}): unknown {
-  const reconciledParams = reconcileCodeModeExecBeforeHookParams({
-    owner: { tool: params.tool },
-    originalParams: params.preparedParams,
-    hookParams: params.hookParams,
-    adjustedParams: params.adjustedParams,
-  });
-  // Tool preparation may key private state in a WeakMap by this exact object.
-  // Keep the original identity until finalization transfers valid state to rewrites.
-  const finalize = params.tool.finalizeBeforeToolCallParams;
-  if (!finalize) {
-    return reconciledParams;
-  }
-  if (params.finalizerMode === "adapter") {
-    return finalize(reconciledParams, params.preparedParams);
-  }
-  return finalize.call(params.tool, reconciledParams, params.preparedParams) ?? reconciledParams;
-}
-
-class BeforeToolCallBlockedError extends Error {
-  constructor(readonly reason: string) {
-    super(reason);
-    this.name = "BeforeToolCallBlockedError";
-  }
-}
-
-if (process.env.VITEST || process.env.NODE_ENV === "test") {
-  (globalThis as Record<PropertyKey, unknown>)[
-    Symbol.for("openclaw.beforeToolCallBlockedErrorTestApi")
-  ] = {
-    create(message: string): Error {
-      return new BeforeToolCallBlockedError(message);
-    },
-  };
-}
-
-class BeforeToolCallFailureError extends Error {
-  constructor(
-    message: string,
-    readonly disposition: BeforeToolCallFailureDisposition,
-    cause?: unknown,
-  ) {
-    super(message, cause === undefined ? undefined : { cause });
-    this.name = "BeforeToolCallFailureError";
-  }
-}
-
-function tagBeforeToolCallFailure(
-  error: unknown,
-  signal?: AbortSignal,
-  stage?: "tool_preparation" | "before_tool_call",
-): BeforeToolCallFailureError {
-  try {
-    if (error instanceof BeforeToolCallFailureError) {
-      return error;
-    }
-  } catch {
-    // Continue through the guarded formatter and classifier for hostile values.
-  }
-  const message = formatToolExecutionErrorMessage(error, "before_tool_call failed");
-  const disposition = resolveToolErrorDiagnostic(error, signal).terminalReason;
-  const tagged = new BeforeToolCallFailureError(message, disposition, error);
-  if (stage === "tool_preparation" && isTrustedToolExecutionPreflightError(error)) {
-    registerTrustedToolNoStartError(tagged);
-  }
-  return tagged;
-}
-
-/** Return the closed terminal disposition carried by a before-tool failure. */
-export function getBeforeToolCallFailureDisposition(
-  error: unknown,
-): BeforeToolCallFailureDisposition | undefined {
-  try {
-    return error instanceof BeforeToolCallFailureError ? error.disposition : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Remember hook-adjusted params for later adapter-side execution. */
-export function recordAdjustedParamsForToolCall(
-  toolCallId: string | undefined,
-  params: unknown,
-  runId?: string,
-): void {
-  if (!toolCallId) {
-    return;
-  }
-  const cloneResult = cloneParamsForAdjustedReplay(params);
-  if (!cloneResult.ok) {
-    return;
-  }
-  adjustedParamsByToolCallId.set(buildAdjustedParamsKey({ runId, toolCallId }), cloneResult.value);
-  pruneMapToMaxSize(adjustedParamsByToolCallId, MAX_TRACKED_ADJUSTED_PARAMS);
-}
-
-function cloneParamsForAdjustedReplay(
-  params: unknown,
-): { ok: true; value: unknown } | { ok: false } {
-  try {
-    return { ok: true, value: structuredClone(params) };
-  } catch {
-    return { ok: false };
-  }
-}
-
-/** Record that one concrete core-owned tool call may use structured replay classification. */
-export function recordStructuredReplayTrustForToolCall(
-  toolCallId: string | undefined,
-  tool: AnyAgentTool,
-  runId?: string,
-): void {
-  if (!toolCallId || getPluginToolMeta(tool) || getChannelAgentToolMeta(tool as never)) {
-    return;
-  }
-  recordStructuredReplaySafeToolCall(toolCallId, runId);
-  while (structuredReplaySafeToolCallIds.size > MAX_TRACKED_ADJUSTED_PARAMS) {
-    const oldest = structuredReplaySafeToolCallIds.values().next().value;
-    if (!oldest) {
-      break;
-    }
-    structuredReplaySafeToolCallIds.delete(oldest);
-  }
-}
-
-/**
- * Returns true when an error represents an intentional before_tool_call veto.
- */
-export function isBeforeToolCallBlockedError(err: unknown): err is BeforeToolCallBlockedError {
-  return err instanceof BeforeToolCallBlockedError;
-}
-
-const preExecutionBlockedToolResults = new WeakSet<object>();
-
-export function isPreExecutionBlockedToolResult(result: unknown): boolean {
-  return (
-    result !== null && typeof result === "object" && preExecutionBlockedToolResults.has(result)
-  );
-}
-
-/** Build the standard terminal result for vetoed tool calls. */
-export function buildBlockedToolResult(params: {
-  reason: string;
-  deniedReason?: HookBlockedReason;
-  toolCallId?: string;
-  runId?: string;
-}) {
-  recordPreExecutionBlockedToolCall(params.toolCallId, params.runId);
-  const result = {
-    content: [{ type: "text" as const, text: params.reason }],
-    details: {
-      status: "blocked",
-      deniedReason: params.deniedReason ?? "plugin-before-tool-call",
-      reason: params.reason,
-    },
-  };
-  preExecutionBlockedToolResults.add(result);
-  return result;
-}
 
 export function wrapToolWithBeforeToolCallHook(
   tool: AnyAgentTool,
@@ -524,6 +352,25 @@ export function wrapToolWithBeforeToolCallHook(
           toolParams: executeParams,
         });
       }
+      // APEX kernel authority (mode "required"): the last word before any side effect, bound
+      // to the final execution params. Exec is skipped here (dedicated spawn-boundary gate).
+      const kernelGate = await runAgentToolKernelAuthorityGate({
+        tool,
+        toolName,
+        params: executeParams,
+        toolCallId,
+        ctx,
+        signal,
+        approvalMode: hookOptions.approvalMode,
+      });
+      if (kernelGate.kind === "blocked") {
+        return await blockToolCall({
+          reason: kernelGate.outcome.reason,
+          deniedReason: "kernel-authority",
+          toolParams: executeParams,
+          genericDecision: true,
+        });
+      }
       // Host capabilities can close while hooks, approval, validation, or
       // steering awaits. Recheck at the final synchronous source boundary.
       signal?.throwIfAborted();
@@ -545,9 +392,16 @@ export function wrapToolWithBeforeToolCallHook(
         try {
           const args = [toolCallId, executeParams, signal, forwardedOnUpdate, ...executionArgs];
           const invoke = () => (execute as ForwardedToolExecution)(...args);
-          result = outcome.ownerDecision
-            ? await invoke()
-            : await runWithGenericToolActionDecision(tool, toolCallId, invoke);
+          try {
+            result = outcome.ownerDecision
+              ? await invoke()
+              : await runWithGenericToolActionDecision(tool, toolCallId, invoke);
+          } catch (error) {
+            await kernelGate.finish("failed");
+            throw error;
+          }
+          // Receipt for the consumed kernel approval (no-op for low-risk/native allows).
+          await kernelGate.finish(authorityOutcomeFromToolResult(result));
         } catch (error) {
           throw hookOptions.protectNetworkErrors !== false &&
             tool.resultContentSource === "network" &&
@@ -721,18 +575,4 @@ export function rewrapToolWithBeforeToolCallHook(
   copyBeforeToolCallWrapperMetadata(tool, rewrapSource);
   copyAgentToolSourceExecutionGuard(tool, rewrapSource);
   return wrapToolWithBeforeToolCallHook(rewrapSource, ctx ?? preservedContext, wrapperOptions);
-}
-
-function recordPreExecutionBlockedToolCall(toolCallId?: string, runId?: string): void {
-  if (!toolCallId) {
-    return;
-  }
-  preExecutionBlockedToolCallIds.add(buildAdjustedParamsKey({ runId, toolCallId }));
-  while (preExecutionBlockedToolCallIds.size > MAX_TRACKED_ADJUSTED_PARAMS) {
-    const oldest = preExecutionBlockedToolCallIds.values().next().value;
-    if (!oldest) {
-      break;
-    }
-    preExecutionBlockedToolCallIds.delete(oldest);
-  }
 }

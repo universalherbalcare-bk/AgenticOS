@@ -8,6 +8,16 @@ export type McpServerCodexConfig = {
   defaultToolsApprovalMode?: McpCodexToolApprovalMode;
 };
 
+/** Kernel authority risk tiers (apex.authority v1). */
+export type McpKernelAuthorityRisk = "R0" | "R1" | "R2" | "R3" | "R4";
+
+export type McpServerKernelAuthorityConfig = {
+  /** Exact MCP tool names the kernel may allow without a record (R1). */
+  readOnlyTools?: string[];
+  /** Exact MCP tool name -> risk tier; wins over readOnlyTools and the server's own annotations. */
+  risk?: Record<string, McpKernelAuthorityRisk>;
+};
+
 export type McpServerToolFilterConfig = {
   /**
    * Exact MCP tool names or simple "*" globs to expose from this server.
@@ -62,6 +72,11 @@ export type McpServerConfig = {
   clientKey?: string;
   /** Optional per-server OpenClaw MCP tool selection. */
   toolFilter?: McpServerToolFilterConfig;
+  /**
+   * Declared kernel authority risk for this server's tools (APEX_AUTHORITY_MODE=required).
+   * Undeclared tools are R2 unless the server annotated them read-only (then R1).
+   */
+  kernelAuthority?: McpServerKernelAuthorityConfig;
   /** Codex-specific projection controls for Codex app-server/runtime config. */
   codex?: McpServerCodexConfig;
   [key: string]: unknown;

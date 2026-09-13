@@ -96,6 +96,7 @@ export type BeforeToolCallPolicyDiagnosticState = {
 
 export type HookBlockedReason =
   | "client-voice-confirmation"
+  | "kernel-authority"
   | "plugin-before-tool-call"
   | "plugin-approval"
   | "plugin-approval-unavailable"

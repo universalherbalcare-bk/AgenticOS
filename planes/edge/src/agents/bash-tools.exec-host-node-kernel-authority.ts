@@ -1,3 +1,4 @@
+import type { invokeNodeSystemRun } from "./bash-tools.exec-host-node-failure.js";
 /**
  * Kernel authority gate wiring for the node host (red-team finding C1).
  *
@@ -23,8 +24,10 @@
  */
 import type { ExecuteNodeHostCommandParams } from "./bash-tools.exec-host-node.types.js";
 import {
+  authorityOutcomeFromExecToolResult,
   classifyKernelAuthorityResult,
   createExecKernelAuthorityGate,
+  finishExecKernelAuthorityGate,
   type ExecBeforeSpawnGate,
   type ExecSpawnAuthorizationInput,
 } from "./bash-tools.exec-kernel-authority-gate.js";
@@ -101,4 +104,49 @@ export function formatNodeHostKernelAuthorityFollowup(params: {
       ? "\nThe plane's approval was recorded, but the APEX kernel still requires its own allow decision for this exact command. Once it is recorded, run the exec again: the retry presents the remembered kernel approval id."
       : "";
   return `${prefix}\n${text}${hint}`;
+}
+
+type NodeInvokeResult = Awaited<ReturnType<typeof invokeNodeSystemRun>>;
+
+/** How a node `system.run` dispatch ended, as far as the receipt is concerned. */
+export type NodeHostKernelAuthorityCompletion =
+  | { kind: "result"; result: AgentToolResult<ExecToolDetails> }
+  | { kind: "invocation"; invocation: NodeInvokeResult }
+  | { kind: "unknown" };
+
+/** Protocol outcome for a node dispatch: exit 0 without timeout succeeded, anything else failed. */
+export function authorityOutcomeFromNodeInvocation(
+  invocation: NodeInvokeResult,
+): "succeeded" | "failed" {
+  if (!invocation.ok) {
+    return "failed";
+  }
+  const raw = invocation.raw as { payload?: unknown } | undefined;
+  const payload =
+    raw?.payload && typeof raw.payload === "object"
+      ? (raw.payload as { exitCode?: unknown; timedOut?: unknown; error?: unknown })
+      : {};
+  return payload.exitCode === 0 && payload.timedOut !== true && !payload.error
+    ? "succeeded"
+    : "failed";
+}
+
+/**
+ * Sends the receipt for the approval the kernel consumed before this dispatch. A no-op when the
+ * gate is absent (native mode) or consumed nothing (low-risk allow). Never throws.
+ */
+export async function finishNodeHostKernelAuthority(
+  gate: ExecBeforeSpawnGate | undefined,
+  completion: NodeHostKernelAuthorityCompletion,
+): Promise<void> {
+  if (!gate) {
+    return;
+  }
+  const outcome =
+    completion.kind === "result"
+      ? authorityOutcomeFromExecToolResult(completion.result)
+      : completion.kind === "invocation"
+        ? authorityOutcomeFromNodeInvocation(completion.invocation)
+        : "unknown";
+  await finishExecKernelAuthorityGate(gate, outcome);
 }

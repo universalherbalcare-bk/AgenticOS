@@ -78,7 +78,9 @@ import {
  * and approved command execution for gateway-backed exec calls.
  */
 import {
+  authorityOutcomeFromExecProcess,
   composeExecBeforeSpawn,
+  finishExecKernelAuthorityGate,
   type ExecBeforeSpawnGate,
 } from "./bash-tools.exec-kernel-authority-gate.js";
 import { appendExecTimeoutRetryGuidance } from "./bash-tools.exec-output.js";
@@ -1538,6 +1540,14 @@ export async function processGatewayAllowlist(
                 }
                 return undefined;
               }, params.kernelAuthorityGate),
+              // Receipt for the consumed kernel approval on the detached (approval-card)
+              // continuation; the inline spawn sends its own from bash-tools.exec-run.ts.
+              onSettledBeforeNotify: (outcome) => {
+                void finishExecKernelAuthorityGate(
+                  params.kernelAuthorityGate,
+                  authorityOutcomeFromExecProcess(outcome),
+                );
+              },
             });
           } catch (error) {
             if (params.signal?.aborted) {

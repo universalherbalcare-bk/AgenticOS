@@ -92,6 +92,7 @@ function buildAppToolPolicyProjections(params: {
           mode: server?.codexApprovalMode,
           ...(tool.codexAnnotations ? { annotations: tool.codexAnnotations } : {}),
         },
+        ...(tool.kernelAuthorityRisk ? { kernelAuthorityRisk: tool.kernelAuthorityRisk } : {}),
       },
     });
     tools.push(projection);
@@ -335,6 +336,7 @@ export function buildBundleMcpToolsFromCatalog(params: {
           mode: server?.codexApprovalMode,
           ...(tool.codexAnnotations ? { annotations: tool.codexAnnotations } : {}),
         },
+        ...(tool.kernelAuthorityRisk ? { kernelAuthorityRisk: tool.kernelAuthorityRisk } : {}),
       },
     });
     tools.push(agentTool);

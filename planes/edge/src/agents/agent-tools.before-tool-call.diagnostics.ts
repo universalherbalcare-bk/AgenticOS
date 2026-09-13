@@ -461,17 +461,23 @@ export function emitToolBlockedSecurityEvent(params: {
             controlId: "tool-loop-detection",
             family: "authorization",
           } as const)
-        : params.deniedReason === "plugin-approval"
+        : params.deniedReason === "kernel-authority"
           ? ({
-              policyId: "plugin-tool-approval",
-              controlId: "plugin-tool-approval",
-              family: "approval",
+              policyId: "apex-kernel-authority",
+              controlId: "kernel-authority",
+              family: "authorization",
             } as const)
-          : ({
-              policyId: "plugin-before-tool-call",
-              controlId: "before-tool-call",
-              family: "approval",
-            } as const);
+          : params.deniedReason === "plugin-approval"
+            ? ({
+                policyId: "plugin-tool-approval",
+                controlId: "plugin-tool-approval",
+                family: "approval",
+              } as const)
+            : ({
+                policyId: "plugin-before-tool-call",
+                controlId: "before-tool-call",
+                family: "approval",
+              } as const);
   emitTrustedSecurityEvent({
     category: "tool",
     action: "tool.execution.blocked",

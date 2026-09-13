@@ -49,6 +49,16 @@ export type McpServerCatalog = {
   toolFilter?: McpServerToolFilterConfig;
   deniedToolNames?: string[];
   codexApprovalMode?: McpCodexToolApprovalMode;
+  /** Declared kernel authority risk mapping (`mcp.servers.<name>.kernelAuthority`), normalized. */
+  kernelAuthority?: McpServerKernelAuthorityCatalog;
+};
+
+/** Normalized per-server kernel authority declaration carried by the catalog. */
+export type McpServerKernelAuthorityCatalog = {
+  /** Exact MCP tool names declared read-only (R1). */
+  readOnlyTools?: string[];
+  /** Exact MCP tool name -> risk tier. Wins over readOnlyTools and server annotations. */
+  risk?: Record<string, "R0" | "R1" | "R2" | "R3" | "R4">;
 };
 
 /** MCP tool entry after server-name sanitization and schema normalization. */
@@ -66,6 +76,8 @@ export type McpCatalogTool = {
   excludedFromOpenClawCatalog?: true;
   deniedBySession?: true;
   codexAnnotations?: McpCodexToolAnnotations;
+  /** Kernel authority risk declared for this tool in the bundle metadata, when any. */
+  kernelAuthorityRisk?: "R0" | "R1" | "R2" | "R3" | "R4";
 };
 
 /** Complete tool catalog for a session-scoped MCP runtime. */

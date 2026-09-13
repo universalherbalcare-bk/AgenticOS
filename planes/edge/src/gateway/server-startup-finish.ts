@@ -1,3 +1,4 @@
+import { KERNEL_GOVERNED_TOOL_CLASSES } from "../agents/agent-tools.kernel-authority-risk.js";
 import {
   getRuntimeConfig,
   getRuntimeConfigSourceSnapshot,
@@ -353,7 +354,7 @@ export async function finishGatewayStartup(params: {
   startupTrace.mark("ready");
   // One unmistakable line per boot: a silent default to "native" (kernel not governing exec)
   // must never be invisible in the gateway log (red-team finding C7).
-  const kernelAuthority = describeKernelAuthorityMode(process.env);
+  const kernelAuthority = describeKernelAuthorityMode(process.env, KERNEL_GOVERNED_TOOL_CLASSES);
   if (kernelAuthority.level === "warn") {
     log.warn(kernelAuthority.message);
   } else {

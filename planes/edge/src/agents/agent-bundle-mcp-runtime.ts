@@ -18,6 +18,10 @@ import {
   mergeMcpToolCatalogs,
 } from "./agent-bundle-mcp-combined.js";
 import {
+  normalizeMcpServerKernelAuthority,
+  resolveDeclaredMcpToolKernelRisk,
+} from "./agent-bundle-mcp-kernel-authority.js";
+import {
   disposeAllSessionMcpRuntimes,
   getSessionMcpRuntimeManagerForTesting,
 } from "./agent-bundle-mcp-manager-api.js";
@@ -808,6 +812,9 @@ function createServerMcpRuntime(
         );
         session.toolMetadata = normalizedTools.metadata;
         const exposedTools = normalizedTools.tools;
+        const kernelAuthority = normalizeMcpServerKernelAuthority(
+          isRecord(rawServer) ? rawServer.kernelAuthority : undefined,
+        );
         const serverEntry: McpServerCatalog = {
           serverName,
           safeServerName,
@@ -830,6 +837,7 @@ function createServerMcpRuntime(
           ...(toolFilter ? { toolFilter } : {}),
           ...(deniedToolNames.size > 0 ? { deniedToolNames: [...deniedToolNames].toSorted() } : {}),
           codexApprovalMode: resolveProjectedMcpCodexToolApprovalMode(serverName, rawServer),
+          ...(kernelAuthority ? { kernelAuthority } : {}),
         };
         const toolEntries: McpCatalogTool[] = [];
         const policyToolEntries: McpCatalogTool[] = [];
@@ -865,6 +873,10 @@ function createServerMcpRuntime(
             ...(excludedFromOpenClawCatalog ? { excludedFromOpenClawCatalog: true as const } : {}),
             ...(deniedBySession ? { deniedBySession: true } : {}),
             codexAnnotations: normalizeMcpCodexToolAnnotations(tool.annotations),
+            ...(() => {
+              const declared = resolveDeclaredMcpToolKernelRisk(kernelAuthority, toolName);
+              return declared ? { kernelAuthorityRisk: declared } : {};
+            })(),
           };
           policyToolEntries.push(entry);
           if (!entry.excludedFromOpenClawCatalog) {

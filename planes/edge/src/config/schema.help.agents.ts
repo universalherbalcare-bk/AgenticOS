@@ -220,6 +220,13 @@ export const AGENT_FIELD_HELP: Record<string, string> = {
     "Exact MCP tool names or simple '*' globs to expose from this server. When omitted, all server tools remain eligible unless excluded.",
   "mcp.servers.*.toolFilter.exclude":
     "Exact MCP tool names or simple '*' globs to hide from this server.",
+  "mcp.servers.*.kernelAuthority":
+    "Declared APEX kernel authority risk for this server's tools, used when APEX_AUTHORITY_MODE=required. Tools declared nowhere are R2 (kernel approval required) unless the server itself annotates them read-only, which yields R1.",
+  "mcp.servers.*.kernelAuthority.readOnlyTools":
+    "Exact MCP tool names the kernel may allow without an approval record (R1). Do not list tools that write, send, or spend.",
+  "mcp.servers.*.kernelAuthority.risk":
+    'Exact MCP tool name -> risk tier ("R0" to "R4"). An entry here wins over readOnlyTools and over the server\'s own annotations.',
+
   "mcp.servers.*.oauth.identity":
     'OAuth credential ownership for this server. Omit this field or use "shared" for operator-managed credentials; use "per-requester" to let each authenticated sender connect their own account.',
   "mcp.servers.*.oauth.authProfileId":

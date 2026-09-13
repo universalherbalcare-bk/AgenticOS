@@ -299,6 +299,12 @@ const McpServerSchema = z
         exclude: z.array(z.string().trim().min(1)).min(1).optional(),
       })
       .optional(),
+    kernelAuthority: z
+      .strictObject({
+        readOnlyTools: z.array(z.string().trim().min(1)).min(1).optional(),
+        risk: z.record(z.string().trim().min(1), z.enum(["R0", "R1", "R2", "R3", "R4"])).optional(),
+      })
+      .optional(),
     codex: z
       .strictObject({
         agents: z

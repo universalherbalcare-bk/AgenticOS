@@ -8,6 +8,7 @@ import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coerci
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
+import { createSelfSignedCert } from "../../test/helpers/self-signed-cert.js";
 import { startProxy, stopProxy, type ProxyHandle } from "./net/proxy/proxy-lifecycle.js";
 import {
   appendApnsResponseBodyCapture,
@@ -27,57 +28,14 @@ const testAuthPrivateKey = generateKeyPairSync("ec", {
   namedCurve: "prime256v1",
 }).privateKey.export({ format: "pem", type: "pkcs8" });
 
-const testApnsServerKey = `-----BEGIN PRIVATE KEY-----`; // pragma: allowlist secret
-const testApnsServerKeyPem = `${testApnsServerKey}
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC1l/DDGxT//Ma2
-1EC7ON4lb+9IOrHHd437rv5DBhMt7ZXpzmfZuXyJWd/RI3ljiCcJeXwTYdzLsyaR
-aMRUnbzOoaI5/9LRdwmo007Y/US1ZxSjXW3L+vl3+QtiAUt6GDBZo49jB/LSCgu3
-lXYcN96OjpkF2j8rBR8Sn7eTUMIkiCFKn8V68hMRhDuHVJHWSGsMcfq8P7jZZ8S0
-31sUvQw8JaAvEhju3GbxbhQH8RnicR4VxI+bZ3v1JTnWNXCSClRmfDAM0AFrWv8k
-qJXrhat4RsppeRSRDjENdUFS+VvW2s/oyaU9hXl3/G+9Srx5ANOCdLy+pTQdkq3b
-Clg7a917AgMBAAECggEACpyyZolJ7PtiyeMI7pTQSp2XFrOZzKw8bgJk4oBtSE66
-AMIqruSx/Fbch3Zl81gzRWosXMRoNYRzkwwHBfwUp612pqJzUzSV9tNBqHJryWWy
-PsL74rx44R1604N7qGSkfE1ci+JP7h1fLOw9M3Rb+1AmOigHomYRhRjNwhXcmp5u
-spnubpOpJhYANFvQbard7yFmz2n1PcmtKOZussMN9F2w3CJ0pucDDEY+kpHVXiRa
-j65STQi9rxoZVKjzCo4UGIrsURZCfrtZFQ5ga8JhzytY4rsgyF6Wl2gOiZ3E+nMs
-34QDdL8ZMBU6in9lb/iVEvBuUdRFqRVtH+zoQRf1RQKBgQDnZps2u40/55XpeoYW
-6fR5tmgGKN4bpcd7r5zRM+831n5v4MqBfJZEq/TeGSw2ddhQbzeezQg+CRzxuVy/
-MGNOKskGSZ5quamwqD3DDw8hIA6KvVpfBIEKfz4O3lbzP/3UsP3CM+c8FS2b7tzm
-Mfggt1caVAj2dBd8cKyXS3bZRQKBgQDI5d4N2tAopvaRyzFXT4rhZPL1drOKCO0L
-QMN8CRK1seke0W4j+pMqnT6uJd+mTGQH7aAUMFcbHvX1Pn8M5SudyljcleH8taxt
-F8gw1tyH3+tnJqXiQOGFlEL6fX2V3ETThVPyVXQ2sIm17Q961tL+gSQPjYXPKTfU
-IG37/9FnvwKBgBWzV6cAW7S8gSCOLvkDI7wuUP8S4hFxsI124Jv15N81rFHNoPAX
-wPfbsHELp0vMLWcNpwerbrRyolZA7eO4I/f2pzeBu+uCUdmRTYl3ZhHTMcntDAaR
-I5DacfVvAHR7cdB6cLG/sFXAHrDa67hiw0Q+LVr4uoZySKmQ336owxKJAoGBAMdZ
-kicdYkF0rGevwZ5qB93xVkXNLAtlIBNyiIikWDSD/lfeafS5yR8YOgKFApD6bKiR
-W6+s6EK5Tke1ZE1fexBwog0BjeY+QINgff44t0z9HZKV/zWsPB1ZKb12mRAEKyfZ
-vZtSwKckNwKX4ix6z5RMgYQNYyJWPFf6dikBiMHxAoGBALEOli/ZehBqx5Bd7bHm
-HKgZBuBmEDn0wdqB9bGXDdY84bjfNJ8crhiO+zFGzHRvwa+eO2dp0iffIFqXVG15
-/DjMPsMlaX2rmmHE0iYpTo3jbDm4TrGf8uhNFJBW2f7UMAvEK30NXi4aajzIadhD
-LxmTaLeSxjQDE6BXgPlf2dr4
------END PRIVATE KEY-----`;
-
-const testApnsServerCert = `-----BEGIN CERTIFICATE-----
-MIIDaDCCAlCgAwIBAgIUafG6emKuR1YWUNOTWjvy32lTx7YwDQYJKoZIhvcNAQEL
-BQAwJTEjMCEGA1UEAwwaYXBpLnNhbmRib3gucHVzaC5hcHBsZS5jb20wHhcNMjYw
-NTAxMDIzMjM2WhcNMzYwNDI4MDIzMjM2WjAlMSMwIQYDVQQDDBphcGkuc2FuZGJv
-eC5wdXNoLmFwcGxlLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-ALWX8MMbFP/8xrbUQLs43iVv70g6scd3jfuu/kMGEy3tlenOZ9m5fIlZ39EjeWOI
-Jwl5fBNh3MuzJpFoxFSdvM6hojn/0tF3CajTTtj9RLVnFKNdbcv6+Xf5C2IBS3oY
-MFmjj2MH8tIKC7eVdhw33o6OmQXaPysFHxKft5NQwiSIIUqfxXryExGEO4dUkdZI
-awxx+rw/uNlnxLTfWxS9DDwloC8SGO7cZvFuFAfxGeJxHhXEj5tne/UlOdY1cJIK
-VGZ8MAzQAWta/ySoleuFq3hGyml5FJEOMQ11QVL5W9baz+jJpT2FeXf8b71KvHkA
-04J0vL6lNB2SrdsKWDtr3XsCAwEAAaOBjzCBjDAdBgNVHQ4EFgQUcS8iUpQu0qs4
-MHxfmbd6WjvplH4wHwYDVR0jBBgwFoAUcS8iUpQu0qs4MHxfmbd6WjvplH4wDwYD
-VR0TAQH/BAUwAwEB/zA5BgNVHREEMjAwghphcGkuc2FuZGJveC5wdXNoLmFwcGxl
-LmNvbYISYXBpLnB1c2guYXBwbGUuY29tMA0GCSqGSIb3DQEBCwUAA4IBAQAVP+Qg
-lAjpy9jINCeVkt4x/tdZvenag7tCD03ATQ/jrbndAkoHnJt7if1PXmH4+R/iW59X
-yEv7o+2cTJa1g1QQgHMdiEBhGSGzNCQl8VhvZ6eZ6eeZuVLHZUPoZhV9+eax1sB/
-346JgSF6z2IIjr7H26jumZKuAqQsZwvQBOS20zZk+gewpHd4Xy3KxhLMz5Qtl7Df
-ILty9ZCz2RlAy1H3bzxFEAVQt/SQ4cjmdI1U0svR3iHhpX9qT6DTZYvisjjpUBgN
-0nu1jQgAYFHA2hQmgChmPJUYhkxjXtgemTYyiurXsi3VK/dQ9yrOBkk1MOwuOYZs
-W8tBzWn/ZhBpWD88
------END CERTIFICATE-----`;
+// The fake APNs server's TLS identity is minted per test run (no key material in the tree);
+// the tests that talk to it set NODE_TLS_REJECT_UNAUTHORIZED=0, so a self-signed cert suffices.
+const testApnsServerIdentity = createSelfSignedCert({
+  commonName: "api.sandbox.push.apple.com",
+  dnsNames: ["api.sandbox.push.apple.com", "api.push.apple.com"],
+});
+const testApnsServerKeyPem = testApnsServerIdentity.key;
+const testApnsServerCert = testApnsServerIdentity.cert;
 
 type CapturedApnsRequest = {
   headers: http2.IncomingHttpHeaders;

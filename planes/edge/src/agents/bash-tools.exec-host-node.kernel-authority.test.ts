@@ -59,6 +59,7 @@ const ENV_KEYS = [
   "APEX_AUTHORITY_TIMEOUT_MS",
   "FAKE_AUTHORITY_MODE",
   "FAKE_AUTHORITY_REQUEST_FILE",
+  "FAKE_AUTHORITY_LOG_FILE",
 ];
 
 const APPROVAL_ID = "d".repeat(64);
@@ -69,9 +70,21 @@ request="$(cat)"
 if [ -n "\${FAKE_AUTHORITY_REQUEST_FILE:-}" ]; then
   printf '%s' "$request" > "$FAKE_AUTHORITY_REQUEST_FILE"
 fi
+if [ -n "\${FAKE_AUTHORITY_LOG_FILE:-}" ]; then
+  printf '%s\\n' "$request" >> "$FAKE_AUTHORITY_LOG_FILE"
+fi
+case "$request" in
+  *'"op":"finish"'*)
+    printf '%s\\n' '{"ok":true,"result":{"id":"${APPROVAL_ID}","status":"consumed","reason":"used_once","outcome":"recorded"}}'
+    exit 0
+    ;;
+esac
 case "\${FAKE_AUTHORITY_MODE:-deny}" in
   allow)
     printf '%s\\n' '{"ok":true,"result":{"decision":"allow","reason":"low_risk","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":null}}'
+    ;;
+  allow_consumed)
+    printf '%s\\n' '{"ok":true,"result":{"decision":"allow","reason":"approval_consumed","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":"${APPROVAL_ID}","consumed_at":1700000000000}}'
     ;;
   approval_required)
     printf '%s\\n' '{"ok":true,"result":{"decision":"approval_required","reason":"approval_required","operation":"tool.execute","resource":"exec","risk":"R3","approval_id":"${APPROVAL_ID}","expires_at":4102444800000}}'
@@ -83,13 +96,29 @@ esac
 exit 0
 `;
 
-type ShimFixture = { dir: string; shim: string; requestFile: string };
+type ShimFixture = { dir: string; shim: string; requestFile: string; logFile: string };
 
 function createShimFixture(): ShimFixture {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "node-kernel-authority-shim-"));
   const shim = path.join(dir, "apex-authority");
   fs.writeFileSync(shim, SHIM_SCRIPT, { mode: 0o755 });
-  return { dir, shim, requestFile: path.join(dir, "request.json") };
+  return {
+    dir,
+    shim,
+    requestFile: path.join(dir, "request.json"),
+    logFile: path.join(dir, "requests.jsonl"),
+  };
+}
+
+function readRequestLog(fixture: ShimFixture): Array<Record<string, unknown>> {
+  if (!fs.existsSync(fixture.logFile)) {
+    return [];
+  }
+  return fs
+    .readFileSync(fixture.logFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function readSentRequest(fixture: ShimFixture): Record<string, unknown> & {
@@ -119,6 +148,7 @@ describeUnix("node host kernel authority gate (C1)", () => {
     fixture = createShimFixture();
     setTestEnvValue("APEX_AUTHORITY_CMD", fixture.shim);
     setTestEnvValue("FAKE_AUTHORITY_REQUEST_FILE", fixture.requestFile);
+    setTestEnvValue("FAKE_AUTHORITY_LOG_FILE", fixture.logFile);
 
     const previousRegistry = captureActivePluginRegistrySnapshot();
     onTestFinished(() => rollbackStagedPluginRegistry(previousRegistry));
@@ -298,6 +328,69 @@ describeUnix("node host kernel authority gate (C1)", () => {
     });
     expect(result.details).toMatchObject({ status: "failed", reason: "policy-denied" });
     expect(fs.existsSync(fixture.requestFile)).toBe(false);
+  });
+
+  it("required + consumed approval (inline): dispatched once, then a receipt with outcome succeeded names the consumed id", async () => {
+    setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+    setTestEnvValue("FAKE_AUTHORITY_MODE", "allow_consumed");
+
+    const result = await executeNodeHostCommand({ ...request });
+
+    expect(invokeCount).toBe(1);
+    expect(result.details).toMatchObject({ status: "completed", aggregated: "node-kernel-proof" });
+    await vi.waitFor(() => {
+      expect(readRequestLog(fixture).filter((entry) => entry.op === "finish")).toHaveLength(1);
+    });
+    const log = readRequestLog(fixture);
+    expect(log.map((entry) => entry.op)).toEqual(["decide", "finish"]);
+    expect(log[1]).toMatchObject({ approval_id: APPROVAL_ID, outcome: "succeeded" });
+  });
+
+  it("required + consumed approval (inline), command fails on the node: the receipt says failed", async () => {
+    setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+    setTestEnvValue("FAKE_AUTHORITY_MODE", "allow_consumed");
+
+    const result = await executeNodeHostCommand({ ...request, command: "/bin/sh -c 'exit 7'" });
+
+    expect(invokeCount).toBe(1);
+    expect(result.details).toMatchObject({ status: "failed" });
+    await vi.waitFor(() => {
+      expect(readRequestLog(fixture).filter((entry) => entry.op === "finish")).toHaveLength(1);
+    });
+    expect(readRequestLog(fixture).at(-1)).toMatchObject({
+      approval_id: APPROVAL_ID,
+      outcome: "failed",
+    });
+  });
+
+  it("required + consumed approval on the deferred continuation: the receipt follows the node's answer", async () => {
+    setTestEnvValue("APEX_AUTHORITY_MODE", "required");
+    setTestEnvValue("FAKE_AUTHORITY_MODE", "allow_consumed");
+
+    const result = await executeNodeHostCommand({
+      ...request,
+      ask: "always",
+      approvalFollowupMode: "agent",
+    });
+    expect(result.details).toMatchObject({ status: "approval-pending" });
+    expect(readRequestLog(fixture)).toEqual([]);
+
+    await decisionEntered.promise;
+    resolveDecision({ decision: "allow-once" });
+
+    await vi.waitFor(() => {
+      expect(followupSpy).toHaveBeenCalled();
+    });
+    expect(followupSpy.mock.calls[0]?.[1] ?? "").toContain("Exec finished");
+    expect(invokeCount).toBe(1);
+    await vi.waitFor(() => {
+      expect(readRequestLog(fixture).filter((entry) => entry.op === "finish")).toHaveLength(1);
+    });
+    expect(readRequestLog(fixture).map((entry) => entry.op)).toEqual(["decide", "finish"]);
+    expect(readRequestLog(fixture).at(-1)).toMatchObject({
+      approval_id: APPROVAL_ID,
+      outcome: "succeeded",
+    });
   });
 
   it("required + deferred human approval: the plane's grant does not bypass the kernel; a deny is relayed as a follow-up and nothing is dispatched", async () => {

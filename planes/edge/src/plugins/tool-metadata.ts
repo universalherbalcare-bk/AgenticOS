@@ -17,6 +17,12 @@ export type PluginToolMcpMeta = {
     mode?: McpCodexToolApprovalMode;
     annotations?: McpCodexToolAnnotations;
   };
+  /**
+   * Kernel authority risk declared for this MCP tool in the bundle metadata
+   * (`mcp.servers.<name>.kernelAuthority`). Absent means: read-only annotation -> R1, else R2
+   * (see agents/agent-tools.kernel-authority-risk.ts).
+   */
+  kernelAuthorityRisk?: "R0" | "R1" | "R2" | "R3" | "R4";
   node?: {
     id: string;
     displayName?: string;

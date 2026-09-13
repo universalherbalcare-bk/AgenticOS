@@ -50,7 +50,6 @@ import {
   DEFAULT_PENDING_MAX_OUTPUT,
   ExecProcessPreflightError,
   type ExecProcessHandle,
-  type ExecProcessOutcome,
   normalizePathPrepend,
   resolveExecTarget,
   resolveApprovalRunningNoticeMs,
@@ -62,6 +61,7 @@ import {
   shouldSkipExecScriptPreflight,
   validateScriptFileForShellBleed,
 } from "./bash-tools.exec-script-preflight.js";
+import { createExecProcessSettlement } from "./bash-tools.exec-settlement.js";
 import {
   attachExecApprovalReview,
   buildExecForegroundResult,
@@ -69,11 +69,7 @@ import {
   resolveExecElevatedMode,
   resolveExecReviewerDefaults,
 } from "./bash-tools.exec-support.js";
-import {
-  type BackgroundExecTaskHandle,
-  createBackgroundExecTask,
-  finalizeBackgroundExecTask,
-} from "./bash-tools.exec-task-tracking.js";
+import { createBackgroundExecTask } from "./bash-tools.exec-task-tracking.js";
 import type {
   ExecToolApprovalReview,
   ExecToolDefaults,
@@ -89,22 +85,6 @@ type GatewayApprovalResult = Awaited<ReturnType<typeof processGatewayAllowlist>>
 
 const BACKGROUND_EXEC_FOLLOW_UP =
   "Use process (list/poll/log/write/send-keys/submit/paste/kill/clear/remove) for follow-up.";
-
-function createExecProcessSettlement() {
-  const settlement: {
-    outcome: ExecProcessOutcome | null;
-    backgroundTask: BackgroundExecTaskHandle | null;
-    settle: (outcome: ExecProcessOutcome) => void;
-  } = {
-    outcome: null,
-    backgroundTask: null,
-    settle(outcome: ExecProcessOutcome) {
-      settlement.outcome = outcome;
-      finalizeBackgroundExecTask({ handle: settlement.backgroundTask, outcome });
-    },
-  };
-  return settlement;
-}
 
 /** Creates an exec tool instance with runtime defaults and approval policy wiring. */
 export function createExecTool(
@@ -461,6 +441,8 @@ export function createExecTool(
           elevated: elevatedRequested,
           identity: defaults,
         });
+        // The local hosts' settlement sends the kernel receipt (see bash-tools.exec-settlement.ts).
+        settlement.kernelAuthorityGate = kernelAuthorityGate;
 
         if (host === "node") {
           return executeNodeHostCommand({

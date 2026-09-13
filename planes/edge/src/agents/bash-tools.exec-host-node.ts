@@ -30,6 +30,7 @@ import {
 } from "./bash-tools.exec-host-node-failure.js";
 import {
   consultNodeHostKernelAuthority,
+  finishNodeHostKernelAuthority,
   formatNodeHostKernelAuthorityFollowup,
   resolveNodeHostKernelAuthorityGate,
 } from "./bash-tools.exec-host-node-kernel-authority.js";
@@ -561,6 +562,10 @@ export async function executeNodeHostCommand(
               signal: params.signal,
             });
             nodeInvocationCompleted = true;
+            void finishNodeHostKernelAuthority(kernelAuthorityGate, {
+              kind: "invocation",
+              invocation,
+            });
             if (!invocation.ok) {
               await execHostShared.sendExecApprovalFollowupResult(
                 followupTarget,
@@ -595,6 +600,10 @@ export async function executeNodeHostCommand(
               : `Exec finished (node=${target.nodeId} id=${approvalId}, ${exitLabel})`;
             await execHostShared.sendExecApprovalFollowupResult(followupTarget, summary);
           } catch {
+            if (nodeInvocationStarted && !nodeInvocationCompleted) {
+              // The dispatch left without an answer: the node may or may not have run it.
+              void finishNodeHostKernelAuthority(kernelAuthorityGate, { kind: "unknown" });
+            }
             if (params.signal?.aborted || nodeInvocationCompleted) {
               return;
             }
@@ -679,12 +688,21 @@ export async function executeNodeHostCommand(
     return kernelBlocked;
   }
   params.signal?.throwIfAborted();
-  return dispatchNodeSystemRun({
-    request: params,
-    target,
-    invoke,
-    ...((inlineApprovedByAsk || inlineApprovalSource) && inlineApprovalId
-      ? { scopes: APPROVED_NODE_INVOKE_SCOPES }
-      : {}),
-  });
+  let dispatched: AgentToolResult<ExecToolDetails>;
+  try {
+    dispatched = await dispatchNodeSystemRun({
+      request: params,
+      target,
+      invoke,
+      ...((inlineApprovedByAsk || inlineApprovalSource) && inlineApprovalId
+        ? { scopes: APPROVED_NODE_INVOKE_SCOPES }
+        : {}),
+    });
+  } catch (error) {
+    // No answer from the node: the receipt says so instead of guessing.
+    void finishNodeHostKernelAuthority(kernelAuthorityGate, { kind: "unknown" });
+    throw error;
+  }
+  void finishNodeHostKernelAuthority(kernelAuthorityGate, { kind: "result", result: dispatched });
+  return dispatched;
 }

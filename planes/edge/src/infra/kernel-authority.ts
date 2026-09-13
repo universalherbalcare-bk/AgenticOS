@@ -187,21 +187,26 @@ export type KernelAuthorityModeDescription = {
  */
 export function describeKernelAuthorityMode(
   env: NodeJS.ProcessEnv = process.env,
+  /** Tool classes the plane's gates govern in mode "required"; listed after the mode line. */
+  governedToolClasses?: readonly string[],
 ): KernelAuthorityModeDescription {
   const config = resolveKernelAuthorityConfig(env);
   const settings = `dir=${config.directory ?? "(default)"} timeoutMs=${config.timeoutMs} maxConcurrency=${config.maxConcurrency}`;
+  const classes =
+    governedToolClasses && governedToolClasses.length > 0 ? governedToolClasses.join(", ") : "";
+  const governed = classes ? `; governed tool classes: ${classes}` : "";
   if (config.mode === "required") {
     if (!config.cmd) {
       return {
         mode: "required",
         level: "warn",
-        message: `kernel authority: mode=required but APEX_AUTHORITY_CMD is unset; every exec spawn will be DENIED (kernel_unreachable) until it is set. ${settings}`,
+        message: `kernel authority: mode=required but APEX_AUTHORITY_CMD is unset; every exec spawn and every governed tool call will be DENIED (kernel_unreachable) until it is set. ${settings}${governed}`,
       };
     }
     return {
       mode: "required",
       level: "info",
-      message: `kernel authority: mode=required cmd=${config.cmd} ${settings}; the APEX kernel governs every exec spawn (gateway, sandbox, node hosts)`,
+      message: `kernel authority: mode=required cmd=${config.cmd} ${settings}; the APEX kernel governs every exec spawn (gateway, sandbox, node hosts)${governed}`,
     };
   }
   const rawMode = normalizeNonEmpty(env.APEX_AUTHORITY_MODE);
@@ -214,7 +219,7 @@ export function describeKernelAuthorityMode(
   return {
     mode: "native",
     level: "warn",
-    message: `WARNING kernel authority: mode=native (${why}); the APEX kernel is NOT governing exec on this plane, only plane-local approval policy applies. Set APEX_AUTHORITY_MODE=required and APEX_AUTHORITY_CMD to enable it.${config.cmd ? ` (APEX_AUTHORITY_CMD=${config.cmd} is set but ignored in native mode)` : ""}`,
+    message: `WARNING kernel authority: mode=native (${why}); the APEX kernel is NOT governing exec or any other tool on this plane, only plane-local approval policy applies. Set APEX_AUTHORITY_MODE=required and APEX_AUTHORITY_CMD to enable it.${config.cmd ? ` (APEX_AUTHORITY_CMD=${config.cmd} is set but ignored in native mode)` : ""}${classes ? ` (mode required would govern: ${classes})` : ""}`,
   };
 }
 

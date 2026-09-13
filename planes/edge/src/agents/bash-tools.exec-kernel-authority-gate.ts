@@ -26,12 +26,15 @@ import os from "node:os";
 import { type ExecHost, resolveExecApprovalAllowedDecisions } from "../infra/exec-approvals.js";
 import {
   decide as decideKernelAuthority,
+  finish as finishKernelAuthority,
   resolveKernelAuthorityConfig,
   type AuthorityDecideRequest,
   type AuthorityDecision,
+  type AuthorityOutcome,
   type AuthorityPrincipal,
   type AuthorityRisk,
 } from "../infra/kernel-authority.js";
+import { logWarn } from "../logger.js";
 import {
   createKernelAuthorityPendingMemory,
   type KernelAuthorityPendingMemory,
@@ -140,7 +143,12 @@ export type ExecKernelAuthorityPrincipalSource = {
   scopes?: string[];
 };
 
-function resolveKernelAuthorityPrincipal(
+/**
+ * Maps what the plane knows about the requester onto the protocol principal. Shared with the
+ * generic tool gate (agent-tools.kernel-authority-gate.ts) so exec and every other governed
+ * tool present the same principal for the same requester.
+ */
+export function resolveKernelAuthorityPrincipal(
   source: ExecKernelAuthorityPrincipalSource | undefined,
 ): AuthorityPrincipal {
   const userId = source?.userId?.trim();
@@ -296,6 +304,66 @@ export type ExecBeforeSpawnGate = (
 ) => Promise<AgentToolResult<ExecToolDetails> | undefined>;
 
 /**
+ * The gate the exec tool builds: the `beforeSpawn` function plus the receipt side. After a
+ * kernel `allow` that CONSUMED an approval record (R2+ with an approval id; a low-risk allow
+ * carries no record), `finish` reports how the effect ended so the consumed record does not
+ * stay at outcome "unknown". Exactly one receipt is sent per consumed record: later calls are
+ * no-ops, and a receipt failure is logged (id only) but never alters the tool result, because
+ * the effect has already run.
+ */
+export type ExecKernelAuthorityGate = ExecBeforeSpawnGate & {
+  finish: (outcome: AuthorityOutcome) => Promise<void>;
+  /** Test/diagnostic hook: the consumed approval id awaiting a receipt, if any. */
+  consumedApprovalId: () => string | undefined;
+};
+
+/**
+ * Sends the receipt through `gate` when it is a full `ExecKernelAuthorityGate`; hosts also
+ * accept a bare `beforeSpawn` function (test doubles, composed gates), for which this is a
+ * no-op. Never throws.
+ */
+export async function finishExecKernelAuthorityGate(
+  gate: ExecBeforeSpawnGate | undefined,
+  outcome: AuthorityOutcome,
+): Promise<void> {
+  const finish = (gate as Partial<ExecKernelAuthorityGate> | undefined)?.finish;
+  if (typeof finish !== "function") {
+    return;
+  }
+  try {
+    await finish(outcome);
+  } catch {
+    // finish() never throws by contract; this guards composed/foreign gates.
+  }
+}
+
+/** Maps a finished exec process to the protocol outcome. */
+export function authorityOutcomeFromExecProcess(outcome: {
+  status: "completed" | "failed";
+  exitCode: number | null;
+  timedOut?: boolean;
+}): AuthorityOutcome {
+  if (outcome.status === "completed" && outcome.exitCode === 0 && !outcome.timedOut) {
+    return "succeeded";
+  }
+  return "failed";
+}
+
+/** Maps a host's terminal exec tool result to the protocol outcome. */
+export function authorityOutcomeFromExecToolResult(
+  result: AgentToolResult<ExecToolDetails>,
+): AuthorityOutcome {
+  const details = result.details;
+  if (details.status === "completed") {
+    return details.exitCode === 0 && !details.timedOut ? "succeeded" : "failed";
+  }
+  if (details.status === "failed") {
+    return details.reason === "outcome-unknown" ? "unknown" : "failed";
+  }
+  return "unknown";
+}
+
+/**
  * Builds a `runExecProcess`-compatible `beforeSpawn` gate for one exec call,
  * or returns `undefined` when the kernel authority integration is inactive
  * (mode "native"). Reads configuration from the environment at call time
@@ -308,13 +376,16 @@ export type ExecBeforeSpawnGate = (
  */
 export function createExecKernelAuthorityGate(
   params: CreateExecKernelAuthorityGateParams,
-): ExecBeforeSpawnGate | undefined {
+): ExecKernelAuthorityGate | undefined {
   const env = params.env ?? process.env;
   const config = resolveKernelAuthorityConfig(env);
   if (config.mode !== "required") {
     return undefined;
   }
-  return async (spawn) => {
+  // The approval record the last allow consumed, until its receipt is sent. A second allow
+  // before the first receipt (PTY retry) replaces it: the earlier spawn never happened.
+  let consumed: string | undefined;
+  const gate = (async (spawn) => {
     const command = spawn?.command ?? params.command;
     const cwd = spawn?.cwd ?? params.cwd;
     const risk: AuthorityRisk = params.elevated ? "R4" : "R3";
@@ -346,6 +417,10 @@ export function createExecKernelAuthorityGate(
     const interpreted = interpretKernelDecision(decision, remembered);
     if (interpreted.kind === "allow") {
       pendingApprovals.forget(partition, key);
+      consumed =
+        typeof decision.approval_id === "string" && decision.approval_id.length > 0
+          ? decision.approval_id
+          : undefined;
       return undefined;
     }
     if (interpreted.kind === "pending") {
@@ -368,7 +443,22 @@ export function createExecKernelAuthorityGate(
       ...(cwd ? { cwd } : {}),
       decision: interpreted.decision,
     });
+  }) as ExecKernelAuthorityGate;
+  gate.consumedApprovalId = () => consumed;
+  gate.finish = async (outcome) => {
+    const approvalId = consumed;
+    if (!approvalId) {
+      return;
+    }
+    consumed = undefined;
+    const receipt = await finishKernelAuthority({ approval_id: approvalId, outcome }, env);
+    if (!receipt.ok) {
+      logWarn(
+        `exec: kernel authority receipt failed (id=${approvalId} outcome=${outcome}): ${receipt.detail}`,
+      );
+    }
   };
+  return gate;
 }
 
 /**
