@@ -41,14 +41,14 @@ jobs:
         # but the number this job prints should be the one the baseline cites.
         run: |
           python -m pip install --upgrade pip
-          pip install -e planes/brain/libs/agno
+          pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
           # Same list as the brain job (plus its four extras) so the number this job prints is
           # the number the baseline records; the gate's own invariant does not depend on it.
           # pytest is pinned below 9.1: pytest 9.1.1's assertion rewriter makes inspect.getsource raise
           # "could not get source code" on Python 3.14, which fails 25 baselined-green tests
           # (tests/unit/environments, tests/unit/scorer digest tests); the same tests pass on 9.0.3
           # and under --assert=plain. Measured 2026-09-13.
-          pip install "pytest<9.1" pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator PyJWT python-multipart websockets httpx
+          pip install -c tests/brain-constraints.txt "pytest<9.1" pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator PyJWT python-multipart websockets httpx
       - name: Deletion ledger matches the tree
         run: python scripts/check-deletion-ledger.py
       # Runs on the job interpreter, which installed the brain plane above. The
@@ -69,8 +69,8 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e planes/brain/libs/agno
-          pip install fastapi uvicorn python-multipart PyJWT websockets openai "pytest<9.1" pytest-asyncio httpx
+          pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
+          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai "pytest<9.1" pytest-asyncio httpx
       - name: Contract parity + bridge suites
         env:
           PYTHONPATH: bridge/py
@@ -96,7 +96,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e planes/brain/libs/agno
+          pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
           # PyJWT, python-multipart, websockets and httpx are part of this list because the
           # 277/312 baselines were recorded with them present. Without them the same suite on the
           # same interpreter reports 391 failed / 480 errors (159 + 164 "regressions", all
@@ -106,7 +106,7 @@ jobs:
           # "could not get source code" on Python 3.14, which fails 25 baselined-green tests
           # (tests/unit/environments, tests/unit/scorer digest tests); the same tests pass on 9.0.3
           # and under --assert=plain. Measured 2026-09-13.
-          pip install "pytest<9.1" pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator PyJWT python-multipart websockets httpx
+          pip install -c tests/brain-constraints.txt "pytest<9.1" pytest-asyncio pytest-mock sqlalchemy requests numpy anthropic openai fastapi uvicorn timeout-decorator PyJWT python-multipart websockets httpx
       # The brain plane inherits ~277 upstream failures that need API keys or
       # uninstalled vendor SDKs, so "pytest exits 0" can never be green and would
       # train everyone to ignore this job. Gate on NEW failures instead.
