@@ -371,6 +371,11 @@
             "tool": {
               "type": "string"
             },
+            "expires_at": {
+              "type": "string",
+              "format": "date-time",
+              "description": "PAUSE semantics (REQ-0042): the instant this approval lapses. The brain waits for a decision until then and resumes on approve; past it the run is BLOCKED (run.failed, reason approval_timed_out) and, under kernel governance, the kernel's own record is resolved as revoked rather than left to lapse."
+            },
             "ts": {
               "type": "string",
               "format": "date-time"
@@ -432,11 +437,26 @@
               "type": "boolean",
               "default": false
             },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "approval_timed_out",
+                "approval_denied",
+                "kernel_denied",
+                "kernel_unreachable",
+                "pause_not_resumable",
+                "executor_error",
+                "client_disconnected",
+                "cancelled"
+              ],
+              "description": "Why the run ended without completing. The first five are BLOCK outcomes (REQ-0042): a tool call was refused, or an approval could not be obtained, and the run was ended rather than resumed. Absent on legacy producers; `error` stays the human-readable text."
+            },
             "ts": {
               "type": "string",
               "format": "date-time"
             }
-          }
+          },
+          "description": "Terminal. Exactly one of run.completed / run.failed ends every turn. A BLOCKED run (a refused tool, a timed-out or denied approval, an unreachable kernel) is a run.failed with retryable=false and a `reason` naming the block."
         }
       ]
     },

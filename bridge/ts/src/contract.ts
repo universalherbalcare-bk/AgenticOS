@@ -63,9 +63,47 @@ export type TurnEvent =
   | { type: "reasoning.delta"; turn_id: string; text: string; ts: string }
   | { type: "tool.started"; turn_id: string; tool: string; args_preview?: string; ts: string }
   | { type: "tool.completed"; turn_id: string; tool: string; ok: boolean; error?: string; ts: string }
-  | { type: "approval.required"; turn_id: string; approval_id: string; prompt: string; tool?: string; ts: string }
+  /** PAUSE (REQ-0042): the run waits for a decision until `expires_at`, then is BLOCKED. */
+  | { type: "approval.required"; turn_id: string; approval_id: string; prompt: string; tool?: string; expires_at?: string; ts: string }
   | { type: "run.completed"; turn_id: string; run_id?: string; output: string; usage?: Usage; ts: string }
-  | { type: "run.failed"; turn_id: string; error: string; retryable?: boolean; ts: string };
+  /** Terminal. A BLOCKED run is `run.failed` with `retryable: false` and a `reason` in BLOCK_REASONS. */
+  | { type: "run.failed"; turn_id: string; error: string; retryable?: boolean; reason?: FailureReason; ts: string };
+
+/** Why a run ended without completing; mirrors the schema's `reason` enum on run.failed. */
+export type FailureReason =
+  | "approval_timed_out"
+  | "approval_denied"
+  | "kernel_denied"
+  | "kernel_unreachable"
+  | "pause_not_resumable"
+  | "executor_error"
+  | "client_disconnected"
+  | "cancelled";
+
+/** Runtime mirror of FailureReason, checked against the schema by contract.parity.test.ts. */
+export const FAILURE_REASONS = [
+  "approval_timed_out",
+  "approval_denied",
+  "kernel_denied",
+  "kernel_unreachable",
+  "pause_not_resumable",
+  "executor_error",
+  "client_disconnected",
+  "cancelled",
+] as const satisfies readonly FailureReason[];
+
+/** The reasons that mean BLOCK (REQ-0042): a tool was refused or an approval could not be obtained. */
+export const BLOCK_REASONS = [
+  "approval_timed_out",
+  "approval_denied",
+  "kernel_denied",
+  "kernel_unreachable",
+  "pause_not_resumable",
+] as const satisfies readonly FailureReason[];
+
+export function isBlocked(ev: TurnEvent): boolean {
+  return ev.type === "run.failed" && ev.reason !== undefined && (BLOCK_REASONS as readonly string[]).includes(ev.reason);
+}
 
 export type TurnEventType = TurnEvent["type"];
 

@@ -53,6 +53,13 @@ SHIM_SOURCE = textwrap.dedent(
     # already holds a consumed approval for them, so no edge round trip is needed
     # but a finish() receipt is still owed.
     CONSUMED_TOOLS = {t for t in os.environ.get("AUTHORITY_SHIM_CONSUMED_TOOLS", "").split(",") if t}
+    # When set, every proposed record carries a real expires_at (epoch ms, like the
+    # kernel's) this many ms ahead; unset reproduces the historical `expires_at: 0`.
+    TTL_MS = os.environ.get("AUTHORITY_SHIM_TTL_MS")
+
+
+    def _expires_at():
+        return int(time.time() * 1000) + int(TTL_MS) if TTL_MS else 0
 
 
     def _approval_id_for(state):
@@ -139,7 +146,7 @@ SHIM_SOURCE = textwrap.dedent(
                     result = {
                         "decision": "approval_required", "reason": "approval_required",
                         "operation": "tool.execute", "resource": resource, "risk": risk,
-                        "approval_id": proposed_id, "expires_at": 0,
+                        "approval_id": proposed_id, "expires_at": _expires_at(),
                     }
                 else:
                     result = {
@@ -316,10 +323,19 @@ def shim_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTHORITY_SHIM_LOG", log_path)
     monkeypatch.setenv("AUTHORITY_SHIM_STATE", state_path)
 
-    def set_mode(mode: str, deny_tools: tuple[str, ...] = (), consumed_tools: tuple[str, ...] = ()) -> None:
+    def set_mode(
+        mode: str,
+        deny_tools: tuple[str, ...] = (),
+        consumed_tools: tuple[str, ...] = (),
+        ttl_ms: int | None = None,
+    ) -> None:
         monkeypatch.setenv("AUTHORITY_SHIM_MODE", mode)
         monkeypatch.setenv("AUTHORITY_SHIM_DENY_TOOLS", ",".join(deny_tools))
         monkeypatch.setenv("AUTHORITY_SHIM_CONSUMED_TOOLS", ",".join(consumed_tools))
+        if ttl_ms is None:
+            monkeypatch.delenv("AUTHORITY_SHIM_TTL_MS", raising=False)
+        else:
+            monkeypatch.setenv("AUTHORITY_SHIM_TTL_MS", str(ttl_ms))
 
     return log_path, set_mode, authority_dir
 

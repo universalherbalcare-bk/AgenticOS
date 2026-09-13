@@ -128,11 +128,21 @@ class ToolCompleted(_Strict):
 
 
 class ApprovalRequired(_Strict):
+    """PAUSE (REQ-0042): the run is waiting for a decision.
+
+    ``expires_at`` is the instant the pause lapses. Until then the brain
+    waits and resumes on approve; past it the run is BLOCKED (``RunFailed``
+    with ``reason="approval_timed_out"``) and, under kernel governance, the
+    kernel's own approval record is resolved as revoked rather than merely
+    left to lapse by TTL.
+    """
+
     type: Literal["approval.required"] = "approval.required"
     turn_id: str
     approval_id: str
     prompt: str
     tool: Optional[str] = None
+    expires_at: Optional[str] = None
     ts: str = Field(default_factory=_utcnow)
 
 
@@ -145,11 +155,33 @@ class RunCompleted(_Strict):
     ts: str = Field(default_factory=_utcnow)
 
 
+FailureReason = Literal[
+    "approval_timed_out",
+    "approval_denied",
+    "kernel_denied",
+    "kernel_unreachable",
+    "pause_not_resumable",
+    "executor_error",
+    "client_disconnected",
+    "cancelled",
+]
+
+# The reasons that mean BLOCK (REQ-0042): a tool call was refused, or an
+# approval could not be obtained, and the run was ended rather than resumed.
+BLOCK_REASONS = frozenset(
+    {"approval_timed_out", "approval_denied", "kernel_denied", "kernel_unreachable", "pause_not_resumable"}
+)
+
+
 class RunFailed(_Strict):
+    """Terminal. A BLOCKED run is a ``RunFailed`` with ``retryable=False`` and
+    a ``reason`` in ``BLOCK_REASONS``; ``error`` stays the human-readable text."""
+
     type: Literal["run.failed"] = "run.failed"
     turn_id: str
     error: str
     retryable: bool = False
+    reason: Optional[FailureReason] = None
     ts: str = Field(default_factory=_utcnow)
 
 
@@ -181,5 +213,6 @@ __all__ = [
     "TraceContext", "Target", "Attachment", "Principal", "TurnInput",
     "TurnOptions", "TurnRequest", "Usage", "RunStarted", "OutputDelta",
     "ReasoningDelta", "ToolStarted", "ToolCompleted", "ApprovalRequired", "RunCompleted",
-    "RunFailed", "TurnEvent", "ApprovalDecision", "TERMINAL_EVENT_TYPES",
+    "RunFailed", "FailureReason", "BLOCK_REASONS", "TurnEvent", "ApprovalDecision",
+    "TERMINAL_EVENT_TYPES",
 ]

@@ -69,3 +69,50 @@ def test_models_forbid_unknown_fields():
     """additionalProperties:false in the schema must be enforced in Python too."""
     for name in ("TurnRequest", "Principal", "Target", "TraceContext"):
         assert getattr(C, name).model_config.get("extra") == "forbid", name
+
+
+# ---------------------------------------------------------------------------
+# Per-event property parity (added with REQ-0041/REQ-0042, 2026-09-13). The
+# tests above compare event TYPE sets and request-side properties; an optional
+# field added to one event in the schema but not in Python (or vice versa)
+# passed unnoticed. Every event member's property names must now match exactly.
+
+
+def _schema_event(schema: dict, type_name: str) -> dict:
+    return next(m for m in schema["$defs"]["TurnEvent"]["oneOf"] if m["properties"]["type"]["const"] == type_name)
+
+
+def _python_event(type_name: str):
+    return next(
+        m for m in typing.get_args(typing.get_args(C.TurnEvent)[0]) if m.model_fields["type"].default == type_name
+    )
+
+
+@pytest.mark.parametrize(
+    "type_name",
+    ["run.started", "output.delta", "reasoning.delta", "tool.started", "tool.completed",
+     "approval.required", "run.completed", "run.failed"],
+)
+def test_event_property_names_match(schema, type_name):
+    schema_props = set(_schema_event(schema, type_name)["properties"])
+    python_props = set(_python_event(type_name).model_fields)
+    assert schema_props == python_props, (
+        f"{type_name} property drift: only-schema={schema_props - python_props} "
+        f"only-python={python_props - schema_props}"
+    )
+
+
+def test_run_failed_reason_enum_matches_schema(schema):
+    schema_reasons = set(_schema_event(schema, "run.failed")["properties"]["reason"]["enum"])
+    python_reasons = set(typing.get_args(C.FailureReason))
+    assert schema_reasons == python_reasons, (
+        f"reason enum drift: only-schema={schema_reasons - python_reasons} only-python={python_reasons - schema_reasons}"
+    )
+    assert C.BLOCK_REASONS < python_reasons, "every BLOCK reason must be a valid reason"
+    assert "approval_timed_out" in C.BLOCK_REASONS and "approval_denied" in C.BLOCK_REASONS
+
+
+def test_approval_required_carries_the_pause_ttl(schema):
+    props = _schema_event(schema, "approval.required")["properties"]
+    assert props["expires_at"]["format"] == "date-time"
+    assert "expires_at" not in _schema_event(schema, "approval.required")["required"], "additive: optional"

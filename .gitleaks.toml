@@ -162,11 +162,9 @@ paths = [
   '''^planes/brain/libs/agno/tests/unit/knowledge/test_remote_content_config\.py$''',
   '''^planes/edge/extensions/acpx/src/codex-auth-bridge\.test\.ts$''',
   '''^planes/edge/extensions/msteams/src/sdk\.test\.ts$''',
-  '''^planes/edge/packages/gateway-client/src/client\.watchdog\.test\.ts$''',
   '''^planes/edge/src/agents/sandbox/ssh\.test\.ts$''',
   '''^planes/edge/src/cli/secrets-store-cli\.test\.ts$''',
   '''^planes/edge/src/infra/push-apns\.auth\.test\.ts$''',
-  '''^planes/edge/src/infra/push-apns\.test\.ts$''',
   '''^planes/edge/src/logging/redact\.test\.ts$''',
   '''^planes/edge/test/scripts/detect-private-keys\.test\.ts$''',
 ]

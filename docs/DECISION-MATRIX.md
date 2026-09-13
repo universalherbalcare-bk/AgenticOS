@@ -99,16 +99,94 @@ which is the empirical justification for a two-plane architecture rather than a 
 
 ---
 
-## The two hard integration problems (named, not hidden)
+## The two hard integration problems (named, not hidden) — decided 2026-09-13
+
+Both were recorded here as "unimplemented by design" until 2026-09-13. Each now has a dated,
+ADR-style decision below, enforced in `bridge/py` and proven by executed tests. The original
+problem statements are kept verbatim so the reasoning can be audited.
 
 1. **Double tool loop.** Plugging an Agno `Model` into OpenClaw's `agentLoop` yields two nested tool
    loops, one invisible. Agno's provider-level loop must be deleted and its adapters reduced to the
-   edge `StreamFn` contract. *(Scoped in the deletion ledger; not executed in this session.)*
+   edge `StreamFn` contract. *(Original framing. Superseded by ADR REQ-0041 below: the loop is not
+   deleted, it is made the ONLY loop for a turn.v1 turn, and the bridge owns its pause/resume.)*
 2. **Pause-the-run vs block-the-tool.** Agno unwinds and persists a paused run; OpenClaw blocks
    inside `beforeToolCall` with a timeout. Neither can express the other. Fix: `AgentToolResult`
    needs a third disposition — `suspend`, carrying a `RunRequirement` — so one tool contract can
-   either await (interactive) or unwind and persist (durable). This is the single largest code
-   change the full merge requires.
+   either await (interactive) or unwind and persist (durable). *(Original framing. Superseded by ADR
+   REQ-0042 below, which defines both words across planes and implements them at the bridge.)*
+
+### ADR REQ-0041 — One owner of tool execution across the bridge (2026-09-13)
+
+**Status:** accepted, enforced in `bridge/py/agenticos_bridge/server.py`, proven by
+`tests/e2e/test_tool_owner.py` (real `agno.agent.Agent`, real confirmation-gated tool, scripted
+model; shim kernel and the real APEX kernel).
+
+**Decision.** For every turn.v1 turn the **brain executor's own Agno loop is the single owner of
+tool execution**. The bridge never executes a tool and the edge never executes one on the brain's
+behalf. What the bridge owns is the *pause*: every confirmation-gated tool call surfaces as a
+`RunPaused` frame, the kernel (mode `required`) or the bridge's operator gate (mode `native`)
+decides, and on approval the bridge **resumes the same run** (`executor.acontinue_run(run_id,
+requirements=[confirmed...])`) so the tool executes exactly once, inside the brain loop, after the
+kernel's consume. A denial or timeout never resumes the run.
+
+**Alternatives considered.**
+
+| Option | Verdict | Why |
+|---|---|---|
+| A. Edge owns: the brain surfaces every tool call and never executes; the edge runs it and feeds the result back | rejected | turn.v1 has no tool-result inbound (`TurnRequest.input` is `{text, attachments}` with `additionalProperties:false`); every brain toolkit would have to be re-declared as an edge tool, and Agno's loop would need `external_execution` on every function plus a resume-with-results path. Two registries of the same tools is the duplication R2 exists to remove. |
+| B. Both loops: the edge wraps the bridge as a model provider and runs its own tool loop over the brain's output | rejected | Exactly the double-loop hazard: two places can execute, one of them invisible to the kernel. |
+| C. Brain owns, bridge resumes (chosen) | accepted | One loop, one governance point (the pause), no contract change for tools. The only new bridge responsibility is resumption, which the runtime already exposes. |
+
+**Enforcement (each with a test).**
+1. *Illegal state unrepresentable:* a request carrying `tools` or `input.tool_results` is rejected at
+   the boundary (422) — the edge has no channel through which to make the brain run *its* tools.
+2. *Refused at registration:* Agno resumes a paused run by re-loading it from the executor's `db`;
+   without one `acontinue_run` raises `RunNotFoundError` (verified against the installed package).
+   `BrainBridge` refuses to register an executor that has confirmation-gated tools and no `db`, so an
+   approval can never silently become a no-op in production.
+3. *Resume, not fall through:* after approval the bridge drains the paused stream (Agno persists the
+   paused run's tool-call state AFTER yielding `RunPaused`), confirms every requirement of the frame,
+   and continues the same run streaming. Kernel log order for one governed tool is exactly
+   `decide → resolve(approve) → decide(consume) → finish(succeeded)`, and the side-effect list has
+   one entry.
+4. *No silent completion:* a resumable executor that pauses without confirmable requirements and then
+   ends is reported as `run.failed` / `pause_not_resumable`, never as `run.completed` with empty output.
+
+**What the runtime cannot enforce (stated, not hidden).** The bridge governs turns that cross the
+bridge. Agno's own AgentOS routes (`/agents/{id}/runs`, `/runs/{id}/continue`) remain a second way to
+execute a brain tool if they are reachable; that is a deployment boundary (the bridge is the ONE
+endpoint the edge may call), not something `bridge/py` can close. A blocked run's row stays `paused`
+in the brain's store; the kernel record for it is revoked, so an out-of-band continue would run the
+tool without a kernel decision — the same residual, named once here.
+
+### ADR REQ-0042 — Pause vs block across planes (2026-09-13)
+
+**Status:** accepted, enforced in `bridge/py/agenticos_bridge/server.py` and the contract
+(`bridge/contract/turn.schema.json` v1, additive fields), proven by
+`tests/e2e/test_pause_vs_block.py` (shim kernel and the real APEX kernel).
+
+**Definitions.**
+
+| Word | Meaning across planes | On the wire |
+|---|---|---|
+| **PAUSE** | The run is waiting for a decision **with a TTL** and resumes on approve. The TTL is the turn's `options.timeout_ms`, capped by the kernel record's own `expires_at` (5-minute TTL) in `required` mode, so the bridge never waits for an answer the kernel could no longer resolve. | `approval.required` now carries `expires_at` (RFC 3339). An approve inside the TTL resumes the run exactly once (`resolve` is called once). |
+| **BLOCK** | The tool call is refused and the run **ends**. A timeout is a block. | `run.failed` with `retryable=false` and a `reason` from the closed set `approval_timed_out`, `approval_denied`, `kernel_denied`, `kernel_unreachable`, `pause_not_resumable` (`BLOCK_REASONS`). Non-block failures use `executor_error`, `client_disconnected`, `cancelled`. |
+
+**The Phase 4 P2 gap, closed.** A bridge-side timeout in `required` mode used to leave the kernel's
+pending record to lapse by TTL ("a deliberate simplification"). Now, on timeout, the bridge calls the
+kernel's `resolve` with `approve=false` for **every** record proposed for the frame — the exact
+pending action (same plane, tool, risk, principal, args) — *before* emitting the terminal event, so
+the kernel ledger records the operator's silence as `revoked` (`user_revoked`), not `expired`.
+Against the real kernel, consuming the id afterwards is refused with `record_status: "revoked"`.
+
+**Why "the run ends" rather than "the run continues with the tool refused".** Continuing would mean
+resuming the run with the requirement rejected, which re-invokes the model (a paid request) to
+narrate a refusal the operator already saw, and would present the model's afterword as the turn's
+output. Ending the run with a machine-readable reason keeps the block visible in the channel and
+leaves the choice to retry with the edge. The edge's `isBlocked(ev)` distinguishes a block from a
+retryable failure. Client-synthesised `run.failed` events (transport errors in `client.ts`) carry no
+`reason`; the field is optional and additive, and both parity tests assert the enum and property
+sets match the schema.
 
 ## Cross-cutting hazards flagged by the team
 

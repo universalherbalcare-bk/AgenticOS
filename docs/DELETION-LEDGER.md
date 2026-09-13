@@ -4,7 +4,7 @@ Every removal from the merged tree, with its justification and the evidence trai
 
 This is the audit record for R2 ("remove lower quality/level same types of function/features").
 
-**23 paths deleted** · **11 adjudicated-but-deferred** · **39 orphaned test files removed**
+**23 paths deleted** · **11 adjudicated-but-deferred, all resolved 2026-09-13 (T-18) as KEEP with re-measured consumers** · **39 orphaned test files removed**
 
 
 ## How a deletion was authorised
@@ -64,26 +64,37 @@ These are not merely duplicates; keeping them alongside the winner would have le
 | brain | `libs/agno/agno/knowledge/embedder/langdb.py` | Same shim pattern. |
 | edge | `extensions/memory-lancedb` | Vector-only (no FTS/MMR/decay/citations) and forks a THIRD memory tool surface against active-memory's allow-list; the brain LanceDB adapter already does hybrid on the same engine. |
 
-## Adjudicated as losers, but DEFERRED (not deleted)
+## Adjudicated as losers, but DEFERRED (not deleted) — resolved 2026-09-13 (T-18)
 
 The capability verdict for each of these stands in `DECISION-MATRIX.md`. They remain in the tree
 because they have live consumers in retained code, so removing them is a **refactor of the call sites**, not
 a file deletion. Recording them here — rather than deleting them and breaking the build, or quietly dropping
 the finding — is the honest state.
 
-| Plane | Path | Why it could not be deleted yet |
-|---|---|---|
-| brain | `libs/agno/agno/memory/strategies` | 5 inbound production imports (memory/__init__.py, memory/manager.py, os/routers/memory/memory.py). The edge dreaming consolidation wins on BEHAVIOUR; swapping it means reworking MemoryManager, not deleting a package. |
-| brain | `libs/agno/agno/scheduler/cron.py` | 11 inbound production imports (scheduler/manager.py, executor.py, os/routers/schedules/router.py, tools/studio.py). The edge cron wins on SEMANTICS (DST/jitter); replacing this is a refactor of the schedule engine, not a file deletion. |
-| brain | `libs/agno/agno/tracing/exporter.py` | 2 inbound production imports. The OTLP exporter wins, but DatabaseSpanExporter is still wired into the tracing bootstrap; removal follows the exporter swap. |
-| brain | `libs/agno/agno/os/middleware/trailing_slash.py` | 2 inbound production imports. Removable only once the gateway fully owns the edge and the REST facade stops self-mounting. |
-| brain | `libs/agno/agno/agent/remote.py` | 6 inbound production imports. ACP supersedes it as a PROTOCOL; cutting the Python proxy requires rewiring callers to ACP first. |
-| brain | `libs/agno/agno/team/remote.py` | 6 inbound production imports. Same as agent/remote.py. |
-| brain | `libs/agno/agno/workflow/remote.py` | 6 inbound production imports. Same as agent/remote.py. |
-| brain | `libs/agno/agno/debug.py` | RETAINED AFTER REVIEW: an 18-line log-level shim, but `enable_debug_mode` is imported by many integration tests for subsystems being KEPT (e.g. db/surrealdb). Deleting it cost 6+ valuable test files as collateral. The saving is trivial; the coverage loss is not. Fold into edge logging later via a shim, do not delete. |
-| brain | `libs/agno/agno/client/os.py` | HAS A LIVE CONSUMER: agno/remote/base.py:460 lazily calls `from agno.client import AgentOSClient` inside get_os_client(). Caught by the executed test suite, NOT by static grep (the import names the package, not the deleted submodule). Verdict stands - the edge gateway-protocol should generate this client - but removal must follow rewiring agno/remote/ first. |
-| edge | `src/system-agent/delegation-session.ts` | HAS A LIVE CONSUMER: src/gateway/server-methods/system-agent-session-owner.ts:1 imports resolveSystemAgentDelegationKey from it. Folding it into a merged session-key module is a refactor, not a deletion. |
-| edge | `src/transcripts/summary.ts` | HAS PRODUCTION CONSUMERS: store.ts, store-sqlite.ts, infra/state-migrations.meeting-transcripts-files.ts and summary-model.ts ITSELF import the shared TranscriptsSummary type and renderTranscriptsMarkdown from it. The verdict targeted the heuristic summarizeTranscripts() function, not the module; replacing that function is a refactor, not a file deletion. |
+**T-18 resolution (2026-09-13).** Every deferred row was re-measured with a fresh import scan over the
+whole brain plane (`from agno.x.y import`, `import agno.x.y` and `from agno.x import y` shapes, production
+`libs/agno/agno/` counted separately from tests and cookbook) and, for the two edge rows, a read-only grep
+of `planes/edge/src`. Every one still has production consumers, so every one is **KEPT** with the consumer
+list and the unblock condition written into `docs/deletions.tsv` (fifth column). `scripts/check-deletion-ledger.py`
+now refuses a DEFERRED row that lacks a dated `KEEP (...)... Unblock: ...` resolution, so a deferral can no
+longer be recorded without saying who depends on the path and what would let it go. None was deleted: a
+verdict about quality is still not a licence to break the build, and the counts below are measured, not
+asserted (several are smaller than the ledger originally recorded — the original counts included test and
+cookbook importers).
+
+| Plane | Path | Production importers (re-measured 2026-09-13) | Resolution |
+|---|---|---|---|
+| brain | `libs/agno/agno/memory/strategies` | 3 (`memory/__init__.py`, `memory/manager.py`, `os/routers/memory/memory.py`) + 2 tests + 1 cookbook | KEEP. Unblock: MemoryManager takes a strategy interface the edge dreaming consolidation implements. |
+| brain | `libs/agno/agno/scheduler/cron.py` | 5 (`scheduler/__init__.py`, `manager.py`, `executor.py`, `os/routers/schedules/router.py`, `tools/studio.py`) + 2 tests | KEEP. Unblock: schedule engine takes a cron evaluator interface; port DST/jitter from the edge. |
+| brain | `libs/agno/agno/tracing/exporter.py` | 2 (`tracing/__init__.py`, `tracing/setup.py`) + 1 test | KEEP. Unblock: tracing bootstrap defaults to OTLP; then delete DatabaseSpanExporter. |
+| brain | `libs/agno/agno/os/middleware/trailing_slash.py` | 2 (`os/app.py`, `os/middleware/__init__.py`) + 1 test | KEEP. Unblock: the REST facade stops self-mounting once the gateway owns routing. |
+| brain | `libs/agno/agno/agent/remote.py` | 6 (`agent/__init__.py`, `os/interfaces/a2a/a2a.py`, `os/interfaces/agui/agui.py`, `os/mcp.py`, `os/routers/agents/router.py`, `os/schema.py`) + 7 tests + 1 cookbook | KEEP. Unblock: callers rewired to ACP. |
+| brain | `libs/agno/agno/team/remote.py` | 6 (`os/interfaces/agui/agui.py`, `agui/router.py`, `os/mcp.py`, `os/routers/teams/router.py`, `os/schema.py`, `team/__init__.py`) + 4 tests | KEEP. Unblock: same as `agent/remote.py`. |
+| brain | `libs/agno/agno/workflow/remote.py` | 4 (`os/mcp.py`, `os/routers/workflows/router.py`, `os/schema.py`, `workflow/__init__.py`) + 2 tests | KEEP. Unblock: same as `agent/remote.py`. |
+| brain | `libs/agno/agno/debug.py` | 0 production; 6 test files of RETAINED subsystems import `enable_debug_mode` | KEEP (retained after review, unchanged). Unblock: replace the 6 imports with a logging-level fixture. |
+| brain | `libs/agno/agno/client/os.py` | 1 (`agno/client/__init__.py` re-export) + the lazy `from agno.client import AgentOSClient` in `remote/base.py` `get_os_client()` that a module-path scan cannot see | KEEP. Unblock: `remote/` speaks the edge gateway protocol. |
+| edge | `src/system-agent/delegation-session.ts` | 1 (`src/gateway/server-methods/system-agent-session-owner.ts`) | KEEP. Edge plane, outside this pass's write scope. Unblock: fold `resolveSystemAgentDelegationKey` into the merged session-key module. |
+| edge | `src/transcripts/summary.ts` | 6 (`summary-model.ts`, `store.ts`, `store-sqlite.ts`, `infra/state-migrations.meeting-transcripts-files.ts`, `meeting-bot/transcripts-bridge.runtime.ts`, `agents/tools/transcripts-tool-runtime.ts`) | KEEP. The verdict targets `summarizeTranscripts()`, not the module. Edge plane, outside this pass's write scope. Unblock: replace that function. |
 
 ## Orphaned tests
 

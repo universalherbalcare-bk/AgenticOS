@@ -18,8 +18,9 @@ Two jobs, both real:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Iterator, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple
 
 from agno.models.base import Model
 from agno.models.response import ModelResponse
@@ -31,6 +32,14 @@ class DeterministicModel(Model):
 
     `responder` receives the outgoing message list and returns the reply text,
     so tests can assert on what the agent actually sent to the model.
+
+    `tool_call=(name, args)` scripts ONE tool request: the first model request
+    of a run answers with that tool call (no text); once the outgoing messages
+    carry a `role == "tool"` result the model answers with `reply`. This drives
+    Agno's real tool loop -- including `requires_confirmation` pauses and
+    `acontinue_run` resumption -- with no provider and no network, which is how
+    the bridge proves a requested tool runs exactly once through the governed
+    path (REQ-0041). Each request the model saw is appended to `requests`.
     """
 
     def __init__(
@@ -41,13 +50,16 @@ class DeterministicModel(Model):
         reply: str = "ack",
         chunk_size: int = 8,
         responder: Optional[Callable[[List[Any]], str]] = None,
+        tool_call: Optional[Tuple[str, Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(id=id, name=name, provider=provider, **kwargs)
         self.reply = reply
         self.chunk_size = max(1, int(chunk_size))
         self.responder = responder
+        self.tool_call = tool_call
         self.seen_messages: List[Any] = []
+        self.requests: List[List[Any]] = []
 
     # -- helpers ----------------------------------------------------------
 
@@ -57,6 +69,34 @@ class DeterministicModel(Model):
         if self.responder is not None:
             return self.responder(self.seen_messages)
         return self.reply
+
+    def _wants_tool(self, messages: Optional[List[Any]]) -> bool:
+        """True when the scripted tool call is still owed for this run."""
+        if self.tool_call is None:
+            return False
+        seen = list(messages) if messages else self.seen_messages
+        return not any(getattr(m, "role", None) == "tool" for m in seen)
+
+    def _tool_response(self) -> ModelResponse:
+        name, args = self.tool_call  # type: ignore[misc]
+        return ModelResponse(
+            role="assistant",
+            tool_calls=[
+                {
+                    "id": f"call_{name}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(dict(args), sort_keys=True)},
+                }
+            ],
+        )
+
+    def _respond(self, messages: Optional[List[Any]]) -> List[ModelResponse]:
+        self.requests.append(list(messages) if messages else [])
+        if self._wants_tool(messages):
+            if messages:
+                self.seen_messages = list(messages)
+            return [self._tool_response()]
+        return list(self._chunks(self._text(messages)))
 
     def _full(self, text: str) -> ModelResponse:
         return ModelResponse(
@@ -74,16 +114,20 @@ class DeterministicModel(Model):
     # -- Model interface (all six abstract methods implemented) -----------
 
     def invoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
-        return self._full(self._text(kwargs.get("messages")))
+        messages = kwargs.get("messages")
+        self.requests.append(list(messages) if messages else [])
+        if self._wants_tool(messages):
+            return self._tool_response()
+        return self._full(self._text(messages))
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> ModelResponse:
-        return self._full(self._text(kwargs.get("messages")))
+        return self.invoke(*args, **kwargs)
 
     def invoke_stream(self, *args: Any, **kwargs: Any) -> Iterator[ModelResponse]:
-        yield from self._chunks(self._text(kwargs.get("messages")))
+        yield from self._respond(kwargs.get("messages"))
 
     async def ainvoke_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[ModelResponse]:
-        for chunk in self._chunks(self._text(kwargs.get("messages"))):
+        for chunk in self._respond(kwargs.get("messages")):
             yield chunk
 
     def _parse_provider_response(self, response: Any, **kwargs: Any) -> ModelResponse:

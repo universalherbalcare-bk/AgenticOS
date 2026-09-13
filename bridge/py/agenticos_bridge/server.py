@@ -14,6 +14,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
@@ -148,11 +149,44 @@ class PendingApproval:
 
 @dataclass
 class _Gate:
-    """One tool call of a paused frame that still needs an operator decision."""
+    """One tool call of a paused frame that still needs an operator decision.
+
+    ``kernel_expires_at_ms`` is the kernel record's own TTL (epoch ms) in
+    APEX_AUTHORITY_MODE "required"; the bridge never waits past it, because an
+    answer that arrives after the record lapsed could not be resolved anyway.
+    """
 
     tool: str
     args: dict
     approval_id: str
+    kernel_expires_at_ms: Optional[int] = None
+
+
+def _iso_ms(epoch_ms: int) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _confirmation_gated_tools(executor: Any) -> list[str]:
+    """Names of the executor's tools whose call pauses the run for confirmation.
+
+    Understands the shapes Agno registers: a ``Function`` (what ``@tool`` returns),
+    a ``Toolkit`` (its ``functions`` map plus ``requires_confirmation_tools``),
+    and anything else exposing ``requires_confirmation``/``name``. A shape it
+    does not understand contributes nothing -- this helper feeds a guard that
+    must never raise on a legitimate executor.
+    """
+    names: list[str] = []
+    for tool in getattr(executor, "tools", None) or []:
+        functions = getattr(tool, "functions", None)
+        if isinstance(functions, dict):
+            flagged = set(getattr(tool, "requires_confirmation_tools", None) or [])
+            for fname, fn in functions.items():
+                if getattr(fn, "requires_confirmation", False) or fname in flagged:
+                    names.append(str(fname))
+            continue
+        if getattr(tool, "requires_confirmation", False):
+            names.append(str(getattr(tool, "name", None) or getattr(tool, "__name__", None) or tool))
+    return names
 
 
 def _sse(payload: Any) -> str:
@@ -182,11 +216,11 @@ class BrainBridge:
         required_scope: Optional[str] = None,
         store: Optional[IdempotencyStore] = None,
     ) -> None:
-        self._registry: dict[str, Mapping[str, Any]] = {
-            "agent": dict(agents or {}),
-            "team": dict(teams or {}),
-            "workflow": dict(workflows or {}),
-        }
+        self._registry: dict[str, Mapping[str, Any]] = {"agent": {}, "team": {}, "workflow": {}}
+        for kind, given in (("agent", agents), ("team", teams), ("workflow", workflows)):
+            for executor_id, executor in (given or {}).items():
+                self._assert_governable(kind, executor_id, executor)
+                self._registry[kind][executor_id] = executor
         self._auth_token = auth_token
         self._required_scope = required_scope
         self._store = store or IdempotencyStore()
@@ -203,7 +237,35 @@ class BrainBridge:
     def register(self, kind: str, executor_id: str, executor: Any) -> None:
         if kind not in self._registry:
             raise ValueError(f"unknown executor kind: {kind!r}")
+        self._assert_governable(kind, executor_id, executor)
         self._registry[kind][executor_id] = executor
+
+    @staticmethod
+    def _assert_governable(kind: str, executor_id: str, executor: Any) -> None:
+        """Refuse an executor whose paused runs the bridge could never resume.
+
+        REQ-0041: the brain executor's loop is the ONE owner of tool execution,
+        and every confirmation-gated tool reaches execution only by the bridge
+        resuming the paused run after the kernel/operator decided. Agno resumes
+        a run by re-loading it from the executor's ``db`` (``acontinue_run`` ->
+        ``RunNotFoundError`` without one, verified 2026-09-13 against the
+        installed package). An executor that pauses but has no db would make
+        every approval a silent no-op that ends as ``run.completed`` with empty
+        output -- so it is refused at registration, not discovered in
+        production.
+
+        Executors without ``acontinue_run`` (test fakes, non-Agno adapters) are
+        not resumed by the bridge and are exempt; they own their own pause.
+        """
+        if getattr(executor, "acontinue_run", None) is None:
+            return
+        gated = _confirmation_gated_tools(executor)
+        if gated and getattr(executor, "db", None) is None:
+            raise ValueError(
+                f"{kind} {executor_id!r} has confirmation-gated tools {sorted(set(gated))} but no db: "
+                "Agno cannot resume a paused run without one, so an approved tool could never execute "
+                "through the governed path. Register it with a db (e.g. agno.db.in_memory.InMemoryDb)."
+            )
 
     def _resolve(self, kind: str, executor_id: str) -> Any:
         try:
@@ -243,7 +305,18 @@ class BrainBridge:
     # -- execution --------------------------------------------------------
 
     async def _run(self, req: TurnRequest) -> AsyncIterator[str]:
-        """Execute one turn, translating Agno events onto the bridge contract."""
+        """Execute one turn, translating Agno events onto the bridge contract.
+
+        REQ-0041 -- one owner of tool execution. The executor's own loop runs
+        every tool; the bridge never executes one and never lets the edge do
+        so on the brain's behalf (turn.v1 has no tool-result inbound). When the
+        loop pauses for confirmation the bridge asks the kernel/operator, and
+        on approval RESUMES the same run via ``acontinue_run`` with the
+        requirements confirmed, so the tool executes exactly once, inside the
+        brain loop, after the kernel's consume. A stream that ends after a
+        pause the bridge could not resume is a BLOCK (``pause_not_resumable``),
+        never a silent ``run.completed``.
+        """
         started = time.monotonic()
         executor = self._resolve(req.target.kind, req.target.id)
         yield _sse(RunStarted(turn_id=req.turn_id))
@@ -256,11 +329,16 @@ class BrainBridge:
         # unknown to the bridge, and the kernel receipt must say so (red team
         # C9: it used to say "succeeded").
         terminal_seen = False
+        # True while an approved pause on a resumable executor has not been
+        # followed by the resumed stream; if the stream ends in this state the
+        # tool never ran and the run is blocked, not completed.
+        awaiting_resume = False
         # Kernel approval ids consumed via _handle_pause in APEX_AUTHORITY_MODE
         # "required", awaiting a finish() receipt once this run's own outcome
         # is known. Empty in "native" mode and whenever the kernel path denied
         # or was never consulted.
         kernel_finish_ids: list[str] = []
+        stream: Any = None
         try:
             stream = executor.arun(
                 input=req.input.text,
@@ -269,86 +347,114 @@ class BrainBridge:
                 session_id=req.session_id,
                 user_id=req.principal.user_id,
             )
-            async for ev in stream:
-                name = _normalize_event(_event_name(ev))
-                raw_run_id = getattr(ev, "run_id", None)
-                if raw_run_id is not None:
-                    # Coerce: a non-str run_id would raise inside the terminal
-                    # event constructor, which is built OUTSIDE the try block.
-                    run_id = str(raw_run_id)
+            while True:
+                resumed: Any = None
+                async for ev in stream:
+                    name = _normalize_event(_event_name(ev))
+                    raw_run_id = getattr(ev, "run_id", None)
+                    if raw_run_id is not None:
+                        # Coerce: a non-str run_id would raise inside the terminal
+                        # event constructor, which is built OUTSIDE the try block.
+                        run_id = str(raw_run_id)
 
-                if name in _CONTENT:
-                    chunk = getattr(ev, "content", None)
-                    if isinstance(chunk, str) and chunk:
-                        final_text.append(chunk)
-                        yield _sse(OutputDelta(turn_id=req.turn_id, text=chunk))
+                    if name in _CONTENT:
+                        chunk = getattr(ev, "content", None)
+                        if isinstance(chunk, str) and chunk:
+                            final_text.append(chunk)
+                            yield _sse(OutputDelta(turn_id=req.turn_id, text=chunk))
 
-                elif name in _REASONING:
-                    text = getattr(ev, "content", None) or getattr(ev, "reasoning_content", None)
-                    if isinstance(text, str) and text:
-                        yield _sse(ReasoningDelta(turn_id=req.turn_id, text=text))
+                    elif name in _REASONING:
+                        text = getattr(ev, "content", None) or getattr(ev, "reasoning_content", None)
+                        if isinstance(text, str) and text:
+                            yield _sse(ReasoningDelta(turn_id=req.turn_id, text=text))
 
-                elif name == "ToolCallStarted":
-                    tool_calls += 1
-                    tool = _tool_name(ev)
-                    yield _sse(ToolStarted(turn_id=req.turn_id, tool=tool, args_preview=_args_preview(ev)))
+                    elif name == "ToolCallStarted":
+                        tool_calls += 1
+                        tool = _tool_name(ev)
+                        yield _sse(ToolStarted(turn_id=req.turn_id, tool=tool, args_preview=_args_preview(ev)))
 
-                elif name in _TOOL_OK:
-                    yield _sse(ToolCompleted(turn_id=req.turn_id, tool=_tool_name(ev), ok=True))
+                    elif name in _TOOL_OK:
+                        yield _sse(ToolCompleted(turn_id=req.turn_id, tool=_tool_name(ev), ok=True))
 
-                elif name in _TOOL_ERR:
-                    yield _sse(
-                        ToolCompleted(
-                            turn_id=req.turn_id,
-                            tool=_tool_name(ev),
-                            ok=False,
-                            error=str(getattr(ev, "error", "") or "tool call failed"),
+                    elif name in _TOOL_ERR:
+                        yield _sse(
+                            ToolCompleted(
+                                turn_id=req.turn_id,
+                                tool=_tool_name(ev),
+                                ok=False,
+                                error=str(getattr(ev, "error", "") or "tool call failed"),
+                            )
                         )
-                    )
 
-                elif name in _PAUSED:
-                    # SECURITY: the outcome must gate whether the run continues.
-                    # The previous version consumed _handle_pause and then fell
-                    # through to the next loop iteration, so a DENIED approval
-                    # emitted run.failed and the pending tool executed anyway
-                    # (and the stream emitted two terminal events). Verified by
-                    # tests/e2e/test_approval_gate.py, which wires $1,000,000
-                    # after a denial if this regresses.
-                    outcome: dict[str, Any] = {}
-                    async for frame in self._handle_pause(req, ev, outcome):
-                        yield frame
-                    kernel_finish_ids.extend(outcome.get("kernel_finish_ids") or ())
-                    if not outcome.get("approved", False):
-                        await _aclose(stream)
-                        # Every kernel record this run consumed gets a receipt,
-                        # including one consumed inside a frame that was then
-                        # denied as a whole: the action did not run, so the
-                        # honest outcome for its record is "failed".
+                    elif name in _PAUSED:
+                        # SECURITY: the outcome must gate whether the run continues.
+                        # The previous version consumed _handle_pause and then fell
+                        # through to the next loop iteration, so a DENIED approval
+                        # emitted run.failed and the pending tool executed anyway
+                        # (and the stream emitted two terminal events). Verified by
+                        # tests/e2e/test_approval_gate.py, which wires $1,000,000
+                        # after a denial if this regresses.
+                        outcome: dict[str, Any] = {}
+                        async for frame in self._handle_pause(req, ev, outcome):
+                            yield frame
+                        kernel_finish_ids.extend(outcome.get("kernel_finish_ids") or ())
+                        if not outcome.get("approved", False):
+                            await _aclose(stream)
+                            # Every kernel record this run consumed gets a receipt,
+                            # including one consumed inside a frame that was then
+                            # denied as a whole: the action did not run, so the
+                            # honest outcome for its record is "failed".
+                            if kernel_finish_ids:
+                                await self._finish_kernel_approvals(kernel_finish_ids, "failed")
+                            return
+                        resumed = self._resume(executor, ev, req, run_id)
+                        if resumed is not None:
+                            # Let the executor finish the pause before resuming:
+                            # Agno persists the paused run (its tool-call state)
+                            # AFTER yielding RunPaused. Closing the stream at the
+                            # event instead re-loaded a run without that state,
+                            # the model was asked again, and the run paused a
+                            # second time under the same approval id (observed
+                            # 2026-09-13). Draining costs nothing: a paused Agno
+                            # stream yields nothing further.
+                            async for _trailing in stream:
+                                pass
+                            awaiting_resume = False
+                            break
+                        if getattr(executor, "acontinue_run", None) is not None:
+                            # A resumable executor paused without requirements the
+                            # bridge can confirm (a workflow step, a user-input
+                            # pause). Nothing will run after this stream ends.
+                            awaiting_resume = True
+
+                    elif name in _TERMINAL_ERR:
+                        # Agno does NOT expose `.error` on these events: RunErrorEvent
+                        # carries `.content` and RunCancelledEvent carries `.reason`.
+                        # Reading `.error` made every brain-plane failure reach the edge
+                        # as the literal string "RunError", destroying all diagnostics.
                         if kernel_finish_ids:
                             await self._finish_kernel_approvals(kernel_finish_ids, "failed")
+                        yield _sse(
+                            RunFailed(
+                                turn_id=req.turn_id,
+                                error=_error_text(ev, default=name),
+                                retryable=(name == "RunCancelled"),
+                                reason="cancelled" if name == "RunCancelled" else "executor_error",
+                            )
+                        )
                         return
 
-                elif name in _TERMINAL_ERR:
-                    # Agno does NOT expose `.error` on these events: RunErrorEvent
-                    # carries `.content` and RunCancelledEvent carries `.reason`.
-                    # Reading `.error` made every brain-plane failure reach the edge
-                    # as the literal string "RunError", destroying all diagnostics.
-                    if kernel_finish_ids:
-                        await self._finish_kernel_approvals(kernel_finish_ids, "failed")
-                    yield _sse(
-                        RunFailed(
-                            turn_id=req.turn_id,
-                            error=_error_text(ev, default=name),
-                            retryable=(name == "RunCancelled"),
-                        )
-                    )
-                    return
+                    elif name in _TERMINAL_OK:
+                        terminal_seen = True
+                        awaiting_resume = False
+                        content = getattr(ev, "content", None)
+                        if isinstance(content, str) and content and not final_text:
+                            final_text.append(content)
 
-                elif name in _TERMINAL_OK:
-                    terminal_seen = True
-                    content = getattr(ev, "content", None)
-                    if isinstance(content, str) and content and not final_text:
-                        final_text.append(content)
+                if resumed is None:
+                    break
+                await _aclose(stream)
+                stream = resumed
 
         except asyncio.CancelledError:
             # Client disconnected mid-stream. The tool's own outcome is genuinely
@@ -357,14 +463,38 @@ class BrainBridge:
                 await self._finish_kernel_approvals(kernel_finish_ids, "unknown")
             # Surface it as a terminal event for any recorder downstream, then
             # re-raise so the server tears down.
-            yield _sse(RunFailed(turn_id=req.turn_id, error="client disconnected", retryable=True))
+            yield _sse(
+                RunFailed(turn_id=req.turn_id, error="client disconnected", retryable=True, reason="client_disconnected")
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - boundary: everything becomes a terminal event
             logger.exception("bridge turn %s failed", req.turn_id)
             await self._store.release(req.turn_id)  # genuine failure -> allow retry
             if kernel_finish_ids:
                 await self._finish_kernel_approvals(kernel_finish_ids, "failed")
-            yield _sse(RunFailed(turn_id=req.turn_id, error=f"{type(exc).__name__}: {exc}", retryable=True))
+            yield _sse(
+                RunFailed(
+                    turn_id=req.turn_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    retryable=True,
+                    reason="executor_error",
+                )
+            )
+            return
+
+        if awaiting_resume and not terminal_seen:
+            # BLOCK: the run paused, the pause was approved, and nothing ran.
+            # Reporting run.completed here would present a no-op as success.
+            if kernel_finish_ids:
+                await self._finish_kernel_approvals(kernel_finish_ids, "failed")
+            yield _sse(
+                RunFailed(
+                    turn_id=req.turn_id,
+                    error="run paused for a decision the bridge cannot resume (no confirmable requirements)",
+                    retryable=False,
+                    reason="pause_not_resumable",
+                )
+            )
             return
 
         if kernel_finish_ids:
@@ -387,6 +517,35 @@ class BrainBridge:
                     duration_ms=int((time.monotonic() - started) * 1000),
                 ),
             )
+        )
+
+    @staticmethod
+    def _resume(executor: Any, pause_event: Any, req: TurnRequest, run_id: Optional[str]) -> Any:
+        """Resume an approved pause inside the executor's own loop, or None.
+
+        Confirms every requirement the pause carried and asks the executor to
+        continue the SAME run (``acontinue_run``), streaming, so the confirmed
+        tool executes exactly once where it was requested. Returns None for an
+        executor without ``acontinue_run`` (it owns its own continuation) or a
+        pause event without confirmable requirements.
+        """
+        continue_run = getattr(executor, "acontinue_run", None)
+        requirements = getattr(pause_event, "requirements", None)
+        paused_run_id = getattr(pause_event, "run_id", None) or run_id
+        if continue_run is None or not requirements or paused_run_id is None:
+            return None
+        confirmable = [r for r in requirements if callable(getattr(r, "confirm", None))]
+        if not confirmable:
+            return None
+        for requirement in confirmable:
+            requirement.confirm()
+        return continue_run(
+            run_id=str(paused_run_id),
+            requirements=list(confirmable),
+            session_id=req.session_id,
+            user_id=req.principal.user_id,
+            stream=True,
+            stream_events=True,
         )
 
     async def _finish_kernel_approvals(self, approval_ids: list[str], outcome_label: str) -> None:
@@ -438,6 +597,22 @@ class BrainBridge:
         is no; on approval it emits nothing and the run proceeds to its own
         terminal event.
 
+        PAUSE vs BLOCK (REQ-0042, docs/DECISION-MATRIX.md):
+
+          * PAUSE -- the run waits for a decision with a TTL. The TTL is the
+            turn's ``options.timeout_ms``, capped in "required" mode by the
+            kernel record's own ``expires_at``; it is surfaced on every
+            ``approval.required`` as ``expires_at``. An approve inside the TTL
+            resumes the run exactly once.
+          * BLOCK -- the tool call is refused and the run ENDS as ``run.failed``
+            with ``retryable=False`` and a ``reason`` (``approval_timed_out``,
+            ``approval_denied``, ``kernel_denied``, ``kernel_unreachable``). A
+            timed-out pause is a block: in "required" mode every kernel record
+            proposed for the frame is RESOLVED AS REVOKED (``resolve`` with
+            ``approve=False``) before the terminal event, so the kernel ledger
+            records the operator's silence as a revocation rather than letting
+            the record lapse by TTL.
+
         THE FRAME IS THE UNIT OF AUTHORISATION. Agno resumes a paused run as a
         whole: one continue executes every queued tool call. A version of this
         method authorised only the first tool of the frame, so a frame of
@@ -471,13 +646,6 @@ class BrainBridge:
              `decide(..., approval_id=...)`; only when every consume returns
              `allow` does the run continue. A consume that does not allow
              fails the run and revokes the records not yet resolved.
-
-        A bridge-side approval TIMEOUT while running in "required" mode does
-        not itself call kernel `resolve`: the pending kernel records already
-        carry their own short TTL (<= 300s, see AuthorityService.propose) and
-        will lapse on their own. This is a deliberate simplification, not an
-        oversight -- flagged here since a reviewer should be able to find it
-        without re-deriving it from the diff.
         """
         outcome["approved"] = False
         outcome["kernel_finish_ids"] = []
@@ -502,6 +670,7 @@ class BrainBridge:
                     args=args,
                 )
                 decision_value = decide_result.get("decision")
+                reason: str = "kernel_denied"
                 if decision_value == "allow":
                     # Low risk under the kernel's own policy, or (per the
                     # protocol doc) an already-consumed approval -- either way
@@ -514,24 +683,36 @@ class BrainBridge:
                     kernel_approval_id = decide_result.get("approval_id")
                     if not isinstance(kernel_approval_id, str) or not kernel_approval_id:
                         error = "kernel authority approval_required without an approval id"
+                        reason = "kernel_unreachable"
                     elif any(g.approval_id == kernel_approval_id for g in proposed):
                         error = "kernel authority returned the same approval id for two tools"
+                        reason = "kernel_unreachable"
                     else:
-                        proposed.append(_Gate(tool=kernel_tool, args=args, approval_id=kernel_approval_id))
+                        proposed.append(
+                            _Gate(
+                                tool=kernel_tool,
+                                args=args,
+                                approval_id=kernel_approval_id,
+                                kernel_expires_at_ms=_epoch_ms(decide_result.get("expires_at")),
+                            )
+                        )
                         continue
                 elif decision_value == "deny":
                     detail = decide_result.get("detail") or decide_result.get("reason") or "denied"
                     error = f"kernel authority denied {kernel_tool}: {detail}"
+                    if decide_result.get("reason") == "kernel_unreachable":
+                        reason = "kernel_unreachable"
                 else:
                     # authority.decide() only ever returns one of allow/deny/
                     # approval_required (anything else is normalised to deny by
                     # the client itself) -- this branch exists purely so a
                     # future change to that contract fails closed here too.
                     error = "kernel authority returned an unrecognised decision"
+                    reason = "kernel_unreachable"
                 # Whole-frame deny: nothing in this frame may run.
                 await self._revoke_kernel_approvals(proposed, principal_payload)
                 outcome["kernel_finish_ids"] = consumed
-                yield _sse(RunFailed(turn_id=req.turn_id, error=error, retryable=False))
+                yield _sse(RunFailed(turn_id=req.turn_id, error=error, retryable=False, reason=reason))
                 return
             outcome["kernel_finish_ids"] = consumed
             if not proposed:
@@ -545,6 +726,14 @@ class BrainBridge:
                 # frame gets one id per tool so each can be answered on its own.
                 approval_id = f"{base}:{index}" if multi else base
                 gates.append(_Gate(tool=name or "unknown", args=args, approval_id=approval_id))
+
+        # The pause TTL: the turn's own timeout, never past any kernel record's TTL.
+        now_ms = int(time.time() * 1000)
+        expires_at_ms = now_ms + req.options.timeout_ms
+        for gate in gates:
+            if gate.kernel_expires_at_ms is not None:
+                expires_at_ms = min(expires_at_ms, gate.kernel_expires_at_ms)
+        expires_at = _iso_ms(expires_at_ms)
 
         loop = asyncio.get_running_loop()
         futures: dict[str, asyncio.Future] = {}
@@ -563,11 +752,12 @@ class BrainBridge:
                     approval_id=gate.approval_id,
                     prompt=prompt,
                     tool=gate.tool if gate.tool != "unknown" or multi else None,
+                    expires_at=expires_at,
                 )
             )
 
         denied = False
-        deadline = loop.time() + req.options.timeout_ms / 1000
+        deadline = loop.time() + max(0.0, (expires_at_ms - now_ms) / 1000)
         try:
             waiting = set(futures.values())
             while waiting and not denied:
@@ -584,7 +774,19 @@ class BrainBridge:
                     if decision.decision == "deny":
                         denied = True
         except asyncio.TimeoutError:
-            yield _sse(RunFailed(turn_id=req.turn_id, error="approval timed out", retryable=False))
+            # BLOCK. In "required" mode the kernel is told, so its ledger shows
+            # every record of this frame as revoked (operator silence), not as a
+            # record that quietly reached its TTL (Phase 4 P2).
+            if mode == "required":
+                await self._revoke_kernel_approvals(gates, principal_payload)
+            yield _sse(
+                RunFailed(
+                    turn_id=req.turn_id,
+                    error="approval timed out",
+                    retryable=False,
+                    reason="approval_timed_out",
+                )
+            )
             return
         finally:
             async with self._pending_lock:
@@ -597,7 +799,12 @@ class BrainBridge:
             if mode == "required":
                 await self._revoke_kernel_approvals(gates, principal_payload)
             yield _sse(
-                RunFailed(turn_id=req.turn_id, error="approval denied by operator", retryable=False)
+                RunFailed(
+                    turn_id=req.turn_id,
+                    error="approval denied by operator",
+                    retryable=False,
+                    reason="approval_denied",
+                )
             )
             return
 
@@ -620,6 +827,7 @@ class BrainBridge:
                             turn_id=req.turn_id,
                             error="kernel authority unreachable while resolving the approval",
                             retryable=False,
+                            reason="kernel_unreachable",
                         )
                     )
                     return
@@ -640,6 +848,11 @@ class BrainBridge:
                             turn_id=req.turn_id,
                             error=f"kernel authority did not allow the approved action: {detail}",
                             retryable=False,
+                            reason=(
+                                "kernel_unreachable"
+                                if consume_result.get("reason") == "kernel_unreachable"
+                                else "kernel_denied"
+                            ),
                         )
                     )
                     return
@@ -760,6 +973,16 @@ async def _aclose(stream: Any) -> None:
         await closer()
     except Exception:  # noqa: BLE001 - closing must never mask the real outcome
         logger.debug("provider stream aclose failed", exc_info=True)
+
+
+def _epoch_ms(value: Any) -> Optional[int]:
+    """The kernel's ``expires_at`` (epoch milliseconds) as an int, or None when
+    absent or not a positive number -- a garbled TTL never extends a wait."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0:
+        return None
+    return int(value)
 
 
 def _error_text(ev: Any, default: str) -> str:
