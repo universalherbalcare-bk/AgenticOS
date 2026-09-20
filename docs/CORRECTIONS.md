@@ -120,4 +120,4 @@ governance=native there — no APEX-OS checkout, and the scripts say so) · brid
 |---|---|---|---|
 | 29 | **Bridge job: 29/30 brain-wiring tests, one failure** — `test_provider_model_string_resolves_without_a_key` | The test encoded an environment, not the contract: it required the `anthropic` SDK, present in the developer venv and absent on CI. The code behaved correctly (a `ConfigError` naming the missing SDK). | Test now asserts both halves of the contract (SDK present ⇒ resolves without a key; absent ⇒ `ConfigError` naming executor + SDK), proven in a venv with and without the SDK; CI installs `anthropic` so the positive branch runs there too. |
 
-Run 3: see the commit that follows this entry.
+Run 3 (`1c3029dd`): **all 5 jobs success** — https://github.com/universalherbalcare-bk/AgenticOS/actions/runs/35519700395 . First fully green hosted run.

@@ -50,3 +50,10 @@ config-driven kernel governance (`required`, fail-closed); real-kernel tests un-
 stub model + gate 9 proving the LLM-initiated loop; lockfile regenerated (`--frozen-lockfile` green);
 port-collision detection that names the foreign owner. Open: hosted CI (no remote — needs operator
 confirmation to publish), live-provider inference.
+
+## Third pass — remote + hosted CI
+Remote `github.com/universalherbalcare-bk/AgenticOS` (private) created on the operator's instruction after a
+full-history secret review (2 upstream test fixtures, already removed at HEAD, recorded in `.gitleaksignore`).
+Hosted CI: run 1 exposed #27/#28, run 2 exposed #29, **run 3 all 5 jobs green** — gateway and agent-loop
+E2Es and the zero-regression brain gate now execute on GitHub's runner on every push. Branch protection:
+403 without GitHub Pro / public visibility — operator decision.
