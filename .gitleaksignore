@@ -1,0 +1,8 @@
+# Full-history findings reviewed 2026-09-20 before the first push.
+# Both are private-key TEST FIXTURES byte-identical to upstream OpenClaw's own
+# public repository (github.com/openclaw/openclaw, MIT), marked by upstream with
+# `pragma: allowlist secret`, imported by the rescue commit and REMOVED at HEAD by
+# 95d9da22 ("no committed RSA keys"). They are not credentials for any system and
+# were already public before this repository existed.
+5a2463371bd400e448b6a25ec891b7b2d7cd0ec8:planes/edge/packages/gateway-client/src/client.watchdog.test.ts:private-key:1029
+5a2463371bd400e448b6a25ec891b7b2d7cd0ec8:planes/edge/src/infra/push-apns.test.ts:private-key:30
