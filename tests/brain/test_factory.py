@@ -28,10 +28,27 @@ def test_deterministic_model_with_canned_reply():
     assert isinstance(m, DeterministicModel) and m.reply == "hello there"
 
 
-def test_provider_model_string_resolves_without_a_key():
-    """Construction must not require credentials; only a call does."""
-    m = resolve_model("anthropic:claude-sonnet-4-5", owner="agent x")
-    assert type(m).__name__ == "Claude" and m.id == "claude-sonnet-4-5"
+def test_provider_model_string_resolves_without_a_key_or_names_the_missing_sdk():
+    """The contract has two halves, and the environment decides which one runs:
+
+    - SDK installed: construction must NOT require credentials (only a call does).
+    - SDK absent:    a ConfigError that names the executor AND the missing SDK,
+                     instead of an ImportError three frames deep at first request.
+
+    The first version asserted only the first half and failed on a CI runner
+    without the `anthropic` package while passing on a developer venv that had
+    it - the test encoded an environment, not the contract.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("anthropic") is not None:
+        m = resolve_model("anthropic:claude-sonnet-4-5", owner="agent x")
+        assert type(m).__name__ == "Claude" and m.id == "claude-sonnet-4-5"
+    else:
+        with pytest.raises(ConfigError) as ei:
+            resolve_model("anthropic:claude-sonnet-4-5", owner="agent x")
+        msg = str(ei.value)
+        assert "agent x" in msg and "anthropic" in msg and "not installed" in msg
 
 
 @pytest.mark.parametrize("bad", ["", "gpt-4o", "openai/gpt-4o", "nonexistent-provider:model"])

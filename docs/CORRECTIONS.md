@@ -92,3 +92,32 @@ Every item the previous pass left open or in a warning state, resolved or named.
 ### Still outside this repository's reach
 - **Hosted CI run:** the repo has **no git remote**. `gh` is authenticated, but creating a GitHub repository publishes the code — an outward action that needs the operator's explicit go-ahead. Every CI step has been executed locally.
 - **Live inference with a real provider:** requires a key; the loop is proven on a stub.
+
+---
+
+## 2026-09-20 (third pass) — remote created, first hosted CI runs
+
+Pre-push review of the full history found **2 gitleaks findings**, both `private-key` in test files
+imported from upstream by the rescue commit. Verified byte-identical to upstream OpenClaw's own public
+test fixtures (upstream marks them `pragma: allowlist secret`) and already removed at HEAD. Recorded in
+`.gitleaksignore` with that reasoning; full-history scan clean before the first push. No oversized blobs.
+
+Remote: `https://github.com/universalherbalcare-bk/AgenticOS` — **private** (reversible default; the
+operator did not specify visibility). Branch protection attempted via the API: **HTTP 403 — requires
+GitHub Pro or a public repository.** That is an account-level limit, recorded here rather than implied.
+
+| # | Found by the hosted runner (invisible locally) | Root cause | Fix |
+|---|---|---|---|
+| 27 | **Bridge job: every brain-wiring test failed to import** (`No module named 'sqlalchemy'`) | Agno's `SqliteDb` — the brain's real persistence — is built on SQLAlchemy. The developer venv had it from earlier test deps; the CI install list did not. | Added to both CI installs and `agenticos install`; reproduced first in a fresh venv without it. |
+| 28 | **Secret scan job failed having scanned ~0 bytes** | `gitleaks-action@v2` derives its range from the push event; on a first push that is `<root>^`, which does not exist → git error → partial scan → exit 1. | Direct full-history `gitleaks git --exit-code 1` (same as the local gate), honouring `.gitleaksignore`. |
+
+Run 1 (`727a2310`): merge-integrity ✓ · secret-scan ✗ (#28) · bridge ✗ (#27) · brain/edge superseded.
+Run 2 (`58fb03da`): merge-integrity ✓ · secret-scan ✓ · brain ✓ (**full suite, zero regressions**:
+271 failing == 271 baseline) · edge ✓ (**GATEWAY E2E: PASS** and **AGENT-LOOP E2E: PASS on the runner**,
+governance=native there — no APEX-OS checkout, and the scripts say so) · bridge ✗ (#29 below).
+
+| # | Found by the hosted runner | Root cause | Fix |
+|---|---|---|---|
+| 29 | **Bridge job: 29/30 brain-wiring tests, one failure** — `test_provider_model_string_resolves_without_a_key` | The test encoded an environment, not the contract: it required the `anthropic` SDK, present in the developer venv and absent on CI. The code behaved correctly (a `ConfigError` naming the missing SDK). | Test now asserts both halves of the contract (SDK present ⇒ resolves without a key; absent ⇒ `ConfigError` naming executor + SDK), proven in a venv with and without the SDK; CI installs `anthropic` so the positive branch runs there too. |
+
+Run 3: see the commit that follows this entry.

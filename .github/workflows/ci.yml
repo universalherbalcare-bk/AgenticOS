@@ -71,7 +71,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
           # sqlalchemy: agno.db.sqlite.SqliteDb (the brain's real persistence) is built on it.
-          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai pyyaml sqlalchemy "pytest<9.1" pytest-asyncio httpx
+          # anthropic: lets the factory test exercise "resolves without a key" on CI too.
+          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai anthropic pyyaml sqlalchemy "pytest<9.1" pytest-asyncio httpx
       - name: Contract parity + bridge suites
         env:
           PYTHONPATH: bridge/py:planes/brain
