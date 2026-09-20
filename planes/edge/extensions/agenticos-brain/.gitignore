@@ -1,0 +1,3 @@
+# planes/edge/.gitignore ignores every vendor/ directory (third-party dumps).
+# This one holds tracked, test-guarded verbatim copies of bridge/ts/src — see vendor/sync.mts.
+!vendor/

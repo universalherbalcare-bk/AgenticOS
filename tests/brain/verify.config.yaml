@@ -1,0 +1,28 @@
+# Isolated config used by `agenticos verify` gate 7 and the brain test-suite.
+# Identical shape to the root config, but with its own db under the OS temp
+# dir so verification never touches operator data in data/.
+version: 1
+identity: { name: agenticos-verify, service_namespace: agenticos }
+bridge:
+  contract: turn.v1
+  base_url: "http://127.0.0.1:8919"
+  auth_token: "${AGENTICOS_BRIDGE_TOKEN}"
+  required_scope: "turns:create"
+  timeout_ms: 30000
+  idempotency: sqlite
+brain:
+  host: "127.0.0.1"
+  port: 8919
+  default_model: "agenticos-deterministic"
+  db:
+    file: "${AGENTICOS_VERIFY_DB}"
+  executors:
+    agents:
+      - { id: support, name: Support, model: "agenticos-deterministic:Crossed the plane boundary." }
+      - { id: m, name: Member, model: "agenticos-deterministic:m" }
+    teams:
+      - { id: triage, name: Triage, members: [m], model: "agenticos-deterministic:Team crossed too." }
+    workflows:
+      - { id: flow, name: Flow, steps: [support] }
+edge: { gateway: { enabled: true }, channels: [] }
+observability: { otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}", service_name: agenticos }

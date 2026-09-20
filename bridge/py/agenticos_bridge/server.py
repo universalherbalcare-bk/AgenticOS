@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from . import authority
@@ -346,6 +346,15 @@ class BrainBridge:
                 stream_events=True,
                 session_id=req.session_id,
                 user_id=req.principal.user_id,
+                # ONE trace across both planes: the edge-originated W3C ids ride
+                # into the brain run's metadata, so the run row persisted by the
+                # executor's db carries the same trace_id the edge logged.
+                metadata={
+                    "trace_id": req.trace.trace_id,
+                    "parent_span_id": req.trace.span_id,
+                    "channel": req.principal.channel,
+                    "turn_id": req.turn_id,
+                },
             )
             while True:
                 resumed: Any = None
@@ -892,6 +901,15 @@ class BrainBridge:
     def router(self) -> APIRouter:
         router = APIRouter(prefix="/v1", tags=["agenticos-bridge"])
 
+        async def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+            """Runs as a dependency so it is evaluated BEFORE the request body is
+            validated. Previously `_authenticate` ran inside the handler, i.e.
+            after FastAPI had already parsed the body, so an unauthenticated
+            caller received 422 for a malformed body and 401 only for a
+            well-formed one — leaking schema validity across the auth boundary.
+            Fail closed: no token, no parsing."""
+            self._authenticate(authorization)
+
         @router.get("/bridge/health")
         async def health(authorization: Optional[str] = Header(default=None)) -> dict:
             """Liveness is public; the executor inventory is not.
@@ -911,13 +929,11 @@ class BrainBridge:
             body["executors"] = {k: sorted(v) for k, v in self._registry.items()}
             return body
 
-        @router.post("/turns")
+        @router.post("/turns", dependencies=[Depends(require_auth)])
         async def create_turn(
             req: TurnRequest,
             request: Request,
-            authorization: Optional[str] = Header(default=None),
         ) -> StreamingResponse:
-            self._authenticate(authorization)
             self._authorize(req.principal)
             self._resolve(req.target.kind, req.target.id)  # 404 before opening a stream
 
@@ -937,14 +953,12 @@ class BrainBridge:
                 },
             )
 
-        @router.post("/turns/{turn_id}/approvals/{approval_id}")
+        @router.post("/turns/{turn_id}/approvals/{approval_id}", dependencies=[Depends(require_auth)])
         async def resolve(
             turn_id: str,
             approval_id: str,
             decision: ApprovalDecision,
-            authorization: Optional[str] = Header(default=None),
         ) -> dict:
-            self._authenticate(authorization)
             self._authorize(decision.principal)
             if decision.approval_id != approval_id:
                 raise HTTPException(status_code=400, detail="approval_id mismatch")

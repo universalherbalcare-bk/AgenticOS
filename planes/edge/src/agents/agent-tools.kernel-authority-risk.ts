@@ -225,6 +225,18 @@ export const EDGE_TOOL_KERNEL_RISK: Readonly<Record<string, EdgeToolKernelRiskRu
   sessions_spawn: { class: "sessions", risk: "R1" },
   sessions_yield: { class: "read-only", risk: "R0" },
   subagents: { class: "sessions", risk: "R1" },
+  // AgenticOS brain plane (extensions/agenticos-brain). `agenticos_brain_turn` is a
+  // DELEGATION to another kernel-governed plane, exactly like sessions_spawn /
+  // subagents: the turn itself has no side effect on this plane, and every tool
+  // the brain runs on behalf of the turn is presented to the SAME kernel by the
+  // bridge (decide -> pause -> resolve -> finish). Rating the dispatch R2 would
+  // double-gate every conversational turn behind a human while adding no
+  // protection the brain side does not already enforce. `agenticos_brain_approve`
+  // relays a human decision that RESUMES a paused consequential tool: a model must
+  // never be able to approve its own pause, so it stays at R2 (kernel record,
+  // human required here on the edge).
+  agenticos_brain_turn: { class: "agents", risk: "R1" },
+  agenticos_brain_approve: { class: "agents", risk: "R2" },
   conversations_list: { class: "read-only", risk: "R0" },
   conversations_send: { class: "message", risk: "R2" },
   conversations_turn: { class: "message", risk: "R2" },

@@ -267,3 +267,21 @@ async def test_health_still_reports_executors_when_no_token_is_configured():
     async with client(app) as c:
         body = (await c.get("/v1/bridge/health")).json()
     assert body["executors"]["agent"] == ["support"]
+
+
+@pytest.mark.asyncio
+async def test_authentication_precedes_body_validation():
+    """Fail closed at the boundary: no token => 401, regardless of body shape.
+
+    Regression guard: auth used to run inside the handler, after FastAPI had
+    validated the body, so an anonymous caller got 422 for `{}` and 401 only for
+    a well-formed request - leaking schema validity across the auth boundary.
+    """
+    app, _ = build_app(auth_token=TOKEN)
+    async with client(app) as c:
+        malformed = await c.post("/v1/turns", json={})
+        well_formed = await c.post("/v1/turns", json=turn("t-order"))
+        approval_malformed = await c.post("/v1/turns/x/approvals/y", json={})
+    assert malformed.status_code == 401, malformed.status_code
+    assert well_formed.status_code == 401
+    assert approval_malformed.status_code == 401

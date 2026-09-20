@@ -70,18 +70,33 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
-          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai "pytest<9.1" pytest-asyncio httpx
+          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai pyyaml "pytest<9.1" pytest-asyncio httpx
       - name: Contract parity + bridge suites
         env:
-          PYTHONPATH: bridge/py
+          PYTHONPATH: bridge/py:planes/brain
         run: python -m pytest tests/e2e -q --asyncio-mode=auto
-      - name: Cross-plane end-to-end (TS edge -> Python brain)
+      # Brain-plane wiring: config loader (fail-closed ${VAR}), executor factory with a
+      # REAL db (REQ-0041), ONE app (control plane + bridge), persistence + trace
+      # metadata in the db, and idempotency proven across OS processes.
+      - name: Brain wiring suite
         env:
-          PYTHONPATH: bridge/py
+          PYTHONPATH: bridge/py:planes/brain:tests/brain
+          AGENTICOS_VERIFY_DB: ${{ runner.temp }}/agenticos-verify.db
+        run: python -m pytest tests/brain -q --asyncio-mode=auto
+      # The cross-plane test now runs against the REAL config-driven brain
+      # (python -m agenticos_brain), not the tests/e2e fixture. Same executors the
+      # operator would get from agenticos.config.yaml's shape, isolated db.
+      - name: Cross-plane end-to-end (TS edge -> real Python brain)
+        env:
+          PYTHONPATH: bridge/py:planes/brain
+          AGENTICOS_CONFIG: tests/brain/verify.config.yaml
+          AGENTICOS_VERIFY_DB: ${{ runner.temp }}/agenticos-xplane.db
+          AGENTICOS_BRAIN_PORT: "8919"
+          BRAIN_URL: http://127.0.0.1:8919
         run: |
-          python tests/e2e/brain_server.py &
+          python -m agenticos_brain &
           for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8899/v1/bridge/health && break
+            curl -sf http://127.0.0.1:8919/v1/bridge/health && break
             sleep 0.5
           done
           node --test tests/e2e/cross_plane.test.ts
@@ -147,6 +162,31 @@ jobs:
       - name: Tests for merge-touched areas
         working-directory: planes/edge
         run: corepack pnpm exec vitest run src/transcripts src/system-agent src/config/config.plugin-validation.test.ts
+      # The first runtime path from the edge plane to the brain plane.
+      - name: Edge->brain extension
+        working-directory: planes/edge
+        run: corepack pnpm exec vitest run extensions/agenticos-brain --reporter=dot
+      - name: Kernel risk table (brain tools classified)
+        working-directory: planes/edge
+        run: corepack pnpm exec vitest run src/agents/agent-tools.kernel-authority-risk.test.ts --reporter=dot
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - name: Install brain for the cross-plane gates
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c tests/brain-constraints.txt -e planes/brain/libs/agno
+          pip install -c tests/brain-constraints.txt fastapi uvicorn python-multipart PyJWT websockets openai pyyaml httpx
+      - name: Build edge (the gateway and `agent --local` need dist/)
+        working-directory: planes/edge
+        run: corepack pnpm build
+      # No APEX-OS checkout on CI, so these run with governance=native and say so;
+      # the governed variants run on every developer machine via `agenticos verify`.
+      - name: Gateway -> plugin -> brain -> database
+        env: { AGENTICOS_PYTHON: python }
+        run: bash scripts/e2e-gateway-brain.sh
+      - name: LLM-initiated loop on the deterministic stub model
+        env: { AGENTICOS_PYTHON: python }
+        run: bash scripts/e2e-agent-loop-brain.sh
 
   secrets:
     name: Secret scan

@@ -12,7 +12,9 @@ import { BrainClient } from "../../bridge/ts/src/client.ts";
 import { newTraceContext, isTerminal, type TurnEvent, type TurnRequest } from "../../bridge/ts/src/contract.ts";
 
 const BASE = process.env.BRAIN_URL ?? "http://127.0.0.1:8899";
-const client = new BrainClient({ baseUrl: BASE });
+// Authenticated when the environment carries a token (verify + CI do), so the
+// gate exercises the same fail-closed posture the launcher ships by default.
+const client = new BrainClient({ baseUrl: BASE, authToken: process.env.AGENTICOS_BRIDGE_TOKEN });
 
 function turn(id: string, kind: "agent" | "team" = "agent", target = "support"): TurnRequest {
   return {
@@ -39,9 +41,15 @@ describe("cross-plane bridge", () => {
   });
 
   it("reports the brain plane's registered executors", async () => {
+    // The brain under test is the REAL config-driven server (tests/brain/
+    // verify.config.yaml), not the old fixture: every configured agent is
+    // addressable — including team members — so assert on membership, not on
+    // the fixture's exact list.
     const h = await client.health();
-    assert.deepEqual(h.executors.agent, ["support"]);
+    assert.ok(h.executors.agent.includes("support"), `agents: ${h.executors.agent}`);
+    assert.ok(h.executors.agent.includes("m"), "team member must also be addressable");
     assert.deepEqual(h.executors.team, ["triage"]);
+    assert.ok(h.executors.workflow.includes("flow"), `workflows: ${h.executors.workflow}`);
   });
 
   it("streams a turn from the TS edge to the Python brain and back", async () => {

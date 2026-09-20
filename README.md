@@ -37,14 +37,63 @@ areas, Agno wins 11.
 ## Quick start
 
 ```bash
-./bin/agenticos doctor     # check both planes and the bridge
-./bin/agenticos install    # install brain (python) + edge (node) deps
-./bin/agenticos verify     # run every gate, incl. cross-plane E2E
-./bin/agenticos brain      # run the brain plane
-./bin/agenticos edge --help  # run the edge plane CLI
+./bin/agenticos install    # repo-local .venv (pinned), pnpm install, and the edge build (dist/)
+./bin/agenticos doctor     # config loads fail-closed, executors construct with a real db,
+                           # edge built, plugin ENABLED in the rendered edge config, kernel state
+./bin/agenticos up         # boot brain + edge gateway CONCURRENTLY from agenticos.config.yaml
+./bin/agenticos turn "hello" --target agent:assistant     # one turn through the bridge client
+./bin/agenticos verify     # all 9 gates, ending in a real agent loop choosing the brain tool
 git config core.hooksPath .githooks   # once per clone: the committed pre-commit gate (gitleaks on
                                       # staged changes, deletion ledger, contract parity), fails closed
 ```
+
+## How it is wired (what "one system" means at runtime)
+
+Everything the launcher boots comes from **`agenticos.config.yaml`** and lands in **real persistence**.
+No command starts a test fixture.
+
+```
+agenticos.config.yaml
+   │
+   ├─ brain:   python -m agenticos_brain
+   │            load_config()  fail-closed ${VAR}  ─►  build_executors()  Agent/Team/Workflow,
+   │            each with the SAME SqliteDb (data/agenticos-brain.db)     ─►  ONE FastAPI app:
+   │            AgentOS control plane (/agents /sessions /memories …, 72 paths)
+   │            + bridge (/v1/turns, SSE)  = 75 paths / 116 ops
+   │            turn idempotency: SQLite (data/agenticos-brain.bridge.db), correct across processes
+   │            trace_id / turn_id / channel from the edge ride into every persisted run's metadata
+   │
+   └─ edge:    bin/agenticos renders data/edge/openclaw.json from the SAME resolved config
+                (via `agenticos_brain --dump-json` — one loader, no second YAML parser):
+                gateway.mode=local, token auth by ${ENV} reference, and the
+                agenticos-brain plugin ENABLED and pointed at the brain's bridge URL.
+                extensions/agenticos-brain exposes tool `agenticos_brain_turn` → BrainClient → brain.
+```
+
+Two proven paths, executed on every `verify`:
+
+- **Gate 8 — operator path:** `openclaw gateway call tools.invoke` → gateway RPC → plugin → HTTP+SSE →
+  brain → SQLite; the `run_id`/`trace_id` in the gateway's response are looked up in the database.
+- **Gate 9 — LLM-initiated path:** `openclaw agent --local` runs the **real agent loop** against a
+  deterministic OpenAI-compatible **stub model** (`tests/e2e/stub_llm_server.py`) that always chooses
+  `agenticos_brain_turn`; the loop dispatches the tool, the brain answers, the tool result returns to
+  the loop, and the final reply wraps the brain's output. Model call sequence is asserted to be exactly
+  `[tool, final]`. Only token generation is stubbed — loop, dispatch, bridge, brain and persistence are real.
+
+Both run **authenticated** (the bridge rejects anonymous callers with 401 before parsing a body) and,
+on any machine with `../APEX-OS`, **kernel-governed** in `required` mode on both planes. Live inference
+with a real provider remains outside what this repository can verify without keys.
+
+| Feature | Backend it is wired to | Proof |
+|---|---|---|
+| Executors (agents/teams/workflows) | `brain.executors` in the YAML → real Agno objects | `doctor` builds them; `/agents` and `/v1/bridge/health` list the same ids |
+| Sessions, runs, memories, approvals, traces | `SqliteDb` at `brain.db.file` (16 tables) | `tests/brain/test_app_and_persistence.py`; history from turn 1 reaches the model on turn 2 |
+| Turn idempotency | `SqliteIdempotencyStore` beside the db | 4 OS processes × 25 claims → exactly 1 winner (`test_idempotency_cross_process.py`) |
+| Cross-plane tracing | edge-minted W3C ids → `run.metadata` in the db | gate 8 asserts the persisted `trace_id` equals the gateway response |
+| Edge gateway | rendered `data/edge/openclaw.json` (OpenClaw's own strict, fail-closed loader) | `doctor` reports the plugin **ENABLED**; `up` shows `2 plugins: agenticos-brain, memory-core` |
+| Secrets | `${AGENTICOS_BRIDGE_TOKEN}`, `${AGENTICOS_EDGE_GATEWAY_TOKEN}` env references; **generated into `data/` (0600) when the operator supplies none** | the bridge is authenticated by default; anonymous ⇒ 401 before body parsing; gitleaks hook green |
+| Tool governance | APEX kernel authority (`../APEX-OS`, separate project), `governance.apex_authority.mode: required` in the YAML | both planes log `mode=required cmd=…` at boot; `required` with no launcher ⇒ **refuse to start**; brain tools classified in the edge's audited risk table (turn R1, approve R2) |
+| Human-in-the-loop from the edge | `agenticos_brain_approve` → `POST /v1/turns/{turn}/approvals/{id}` | 6 unit tests; kernel binds the approval on the brain side |
 
 The brain-plane bridge logs one line at startup saying whether the APEX kernel governs tool calls.
 `APEX_AUTHORITY_MODE=native` (the default) logs a **WARNING** that the kernel is *not* in charge;
@@ -104,11 +153,16 @@ they forced are listed in `docs/CORRECTIONS.md`.
 bin/agenticos              one CLI for both planes
 agenticos.config.yaml      one config for both planes
 bridge/contract/           canonical JSON Schema (turn.v1)
-bridge/py/                 brain-side bridge server + deterministic model
+bridge/py/                 brain-side bridge server, SQLite idempotency store, deterministic model
 bridge/ts/                 edge-side bridge client
+planes/brain/agenticos_brain/   the REAL brain server: config loader, executor factory, one-app
 planes/brain/              Python plane (Agno lineage)
+planes/edge/extensions/agenticos-brain/   the edge→brain plugin (tool: agenticos_brain_turn)
 planes/edge/               TypeScript plane (OpenClaw lineage)
+data/                      runtime data (gitignored): brain db, idempotency db, rendered edge config
+tests/brain/               wiring suite: config, factory, one-app, persistence, cross-process idempotency
 tests/e2e/                 contract parity, bridge suites, cross-plane E2E
+scripts/e2e-gateway-brain.sh   gate 8: gateway → plugin → brain → database, isolated
 docs/DECISION-MATRIX.md    which system won each capability, and why
 docs/DELETION-LEDGER.md    what was removed, and what was deferred
 scripts_audit_dangling_refs.py   the deletion-integrity gate

@@ -1,0 +1,86 @@
+{
+  "id": "agenticos-brain",
+  "doctorContract": {
+    "configRepair": true
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "name": "AgenticOS Brain",
+  "description": "Dispatches a turn to the AgenticOS brain plane over the HTTP+SSE bridge and returns the brain's final output.",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8899"
+      },
+      "authToken": {
+        "type": "string"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "defaultTarget": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "team",
+              "workflow"
+            ]
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "baseUrl"
+    ],
+    "additionalProperties": false
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "Bridge Base URL",
+      "help": "HTTP base URL of the AgenticOS bridge (brain plane)."
+    },
+    "authToken": {
+      "label": "Bridge Bearer Token",
+      "sensitive": true,
+      "help": "Sent as `authorization: Bearer ...`. Falls back to the AGENTICOS_BRIDGE_TOKEN environment variable."
+    },
+    "timeoutMs": {
+      "label": "Turn Timeout (ms)",
+      "help": "Wall-clock ceiling for one whole turn. Defaults to 120000."
+    },
+    "defaultTarget": {
+      "label": "Default Target",
+      "help": "Brain-plane executor used when a tool call omits target_kind/target_id."
+    }
+  },
+  "version": "2026.9.1",
+  "contracts": {
+    "tools": [
+      "agenticos_brain_turn",
+      "agenticos_brain_approve"
+    ]
+  },
+  "toolMetadata": {
+    "agenticos_brain_turn": {
+      "optional": true
+    },
+    "agenticos_brain_approve": {
+      "optional": true
+    }
+  }
+}

@@ -2,21 +2,26 @@
 /**
  * AgenticOS — one command for both planes.
  *
- * This file is what makes the merge ONE operating system rather than two repos
- * in a folder: a single entry point that knows about the brain plane (Python),
- * the edge plane (TypeScript), the contract between them, and the gates that
- * keep them honest.
+ * brain  = Python plane (Agno lineage): agents/teams/workflows, knowledge, memory.
+ * edge   = TypeScript plane (OpenClaw lineage): channels, gateway, sandbox, plugins.
+ * bridge = the ONE sanctioned boundary between them (bridge/contract/turn.schema.json).
+ *
+ * Everything this launcher boots is defined in agenticos.config.yaml and backed by
+ * real persistence. Nothing here starts a test fixture.
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BRAIN = join(ROOT, "planes", "brain");
 const EDGE = join(ROOT, "planes", "edge");
-const VENV_PY = join(ROOT, "..", ".venv", "bin", "python");
+const BRIDGE_PY = join(ROOT, "bridge", "py");
+const CONFIG = join(ROOT, "agenticos.config.yaml");
+const PYTHONPATH = [BRIDGE_PY, BRAIN].join(":");
 
 const c = {
   b: (s) => `\x1b[1m${s}\x1b[0m`,
@@ -26,164 +31,491 @@ const c = {
   y: (s) => `\x1b[33m${s}\x1b[0m`,
 };
 
+/**
+ * Interpreter resolution is REPO-LOCAL ONLY. An earlier version looked one
+ * directory above the repo for `.venv` — a scratch-era path that, after the
+ * repo moved to $HOME/AgenticOS, resolved to $HOME/.venv: another project's
+ * interpreter. That is a project-boundary violation, not a fallback.
+ */
 function python() {
-  if (existsSync(VENV_PY)) return VENV_PY;
-  return process.env.AGENTICOS_PYTHON ?? "python3";
+  const local = join(ROOT, ".venv", "bin", "python");
+  if (existsSync(local)) return local;
+  if (process.env.AGENTICOS_PYTHON) return process.env.AGENTICOS_PYTHON;
+  return null;
 }
 
-function readConfig() {
-  const p = join(ROOT, "agenticos.config.yaml");
-  if (!existsSync(p)) return null;
-  const text = readFileSync(p, "utf8");
-  // Deliberately minimal: enough to report identity and the bridge endpoint
-  // without adding a YAML dependency to the launcher. The edge plane owns real
-  // config parsing; this is a launcher, not a second config system.
-  const port = /^\s*port:\s*(\d+)/m.exec(text)?.[1];
-  const base = /base_url:\s*"([^"]+)"/.exec(text)?.[1];
-  const contract = /contract:\s*(\S+)/.exec(text)?.[1];
-  return { port, base, contract, path: p };
+function pyEnv(extra = {}) {
+  return { ...process.env, ...bridgeTokenEnv(), PYTHONPATH, AGENTICOS_CONFIG: process.env.AGENTICOS_CONFIG ?? CONFIG, ...extra };
 }
 
 function run(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { stdio: "inherit", ...opts });
 }
+function capture(cmd, args, opts = {}) {
+  return spawnSync(cmd, args, { encoding: "utf8", ...opts });
+}
+const ok = (l, d = "") => console.log(`  ${c.g("✓")} ${l}${d ? " " + c.dim(d) : ""}`);
+const bad = (l, d = "") => console.log(`  ${c.r("✗")} ${l}${d ? " " + c.dim(d) : ""}`);
+const warn = (l, d = "") => console.log(`  ${c.y("!")} ${l}${d ? " " + c.dim(d) : ""}`);
 
-function ok(label, detail = "") {
-  console.log(`  ${c.g("✓")} ${label}${detail ? " " + c.dim(detail) : ""}`);
+/**
+ * The RESOLVED config, as the brain's own fail-closed loader sees it. The
+ * launcher never parses the YAML itself: one loader, one set of rules, no drift.
+ * Secrets arrive as booleans; the edge config references them by env name.
+ */
+function resolvedConfig(py) {
+  const r = capture(py, ["-m", "agenticos_brain", "--dump-json"], { env: pyEnv() });
+  if (r.status !== 0) {
+    bad("config refused (fail-closed)", (r.stderr || "").trim().split("\n").pop());
+    return null;
+  }
+  return JSON.parse(r.stdout);
 }
-function bad(label, detail = "") {
-  console.log(`  ${c.r("✗")} ${label}${detail ? " " + c.dim(detail) : ""}`);
+
+function brainEndpoint(py) {
+  const cfg = resolvedConfig(py);
+  if (!cfg) return null;
+  const port = Number(process.env.AGENTICOS_BRAIN_PORT ?? cfg.brain.port);
+  return { host: cfg.brain.host, port, url: `http://${cfg.brain.host}:${port}`, cfg };
 }
+
+const DATA = join(ROOT, "data");
+const EDGE_STATE = join(DATA, "edge");
+const EDGE_CONFIG = join(EDGE_STATE, "openclaw.json");
+
+function readOrCreateToken(file) {
+  if (!existsSync(file)) {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, randomBytes(24).toString("hex"), { mode: 0o600 });
+    chmodSync(file, 0o600);
+  }
+  return readFileSync(file, "utf8").trim();
+}
+
+/**
+ * The bridge is authenticated BY DEFAULT. Operators may supply
+ * AGENTICOS_BRIDGE_TOKEN; otherwise one is generated once into
+ * data/.bridge-token (0600) and handed to every process the launcher starts
+ * (brain, edge gateway, `turn`). The previous behaviour — no token unless the
+ * operator remembered to export one — shipped an unauthenticated bridge with a
+ * warning, which is fail-open by default. This is fail-closed by default.
+ */
+function bridgeTokenEnv() {
+  if (process.env.AGENTICOS_BRIDGE_TOKEN) return {};
+  return { AGENTICOS_BRIDGE_TOKEN: readOrCreateToken(join(DATA, ".bridge-token")) };
+}
+
+/**
+ * Kernel governance env from the RESOLVED config. In `required` mode a
+ * launcher must exist or we refuse to start: the planes would otherwise DENY
+ * every governed tool call (correct, but an operator should learn that at boot,
+ * not from a stream of denials).
+ */
+function governanceEnv(cfg) {
+  const g = cfg.governance ?? { mode: "native", cmd: null, default_cmd: null };
+  const cmd = process.env.APEX_AUTHORITY_CMD || g.cmd || (g.default_cmd && existsSync(g.default_cmd) ? g.default_cmd : null);
+  const mode = process.env.APEX_AUTHORITY_MODE || g.mode;
+  if (mode === "required" && !(cmd && existsSync(cmd))) {
+    return { error: `governance.apex_authority.mode=required but no kernel launcher found (APEX_AUTHORITY_CMD unset, ${g.default_cmd ?? "no default"} absent). Set APEX_AUTHORITY_CMD or change mode to native.` };
+  }
+  const env = { APEX_AUTHORITY_MODE: mode, APEX_AUTHORITY_DIR: ROOT };
+  if (cmd) env.APEX_AUTHORITY_CMD = cmd;
+  return { env, mode, cmd };
+}
+
+/** Who holds a TCP port, if anyone. Never kills — only reports. */
+function portOwner(port) {
+  const r = capture("lsof", [`-nP`, `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpc"]);
+  const out = r.stdout || "";
+  const pid = /^p(\d+)/m.exec(out)?.[1];
+  if (!pid) return null;
+  const cmd = capture("ps", ["-p", pid, "-o", "command="]).stdout.trim();
+  return { pid: Number(pid), cmd };
+}
+function isOurs(owner) { return /agenticos_brain|openclaw/.test(owner?.cmd ?? ""); }
+
+/**
+ * Materialise the edge plane's openclaw.json from agenticos.config.yaml.
+ *
+ * This is the wiring that makes the `edge:` block real: OpenClaw reads ONLY its
+ * own file, so without this step the gateway exits 78 ("Missing config") and
+ * the agenticos-brain plugin stays `disabled`. The rendered file:
+ *   - runs the gateway in local mode with token auth;
+ *   - enables exactly the agenticos-brain plugin and points it at the brain's
+ *     bridge URL (respecting AGENTICOS_BRAIN_PORT) with the config's timeout;
+ *   - never contains a secret literal: tokens are `${ENV}` references, which
+ *     OpenClaw's config loader substitutes fail-closed at load time.
+ * The gateway token itself lives in data/edge/.gateway-token (0600) when the
+ * operator has not provided AGENTICOS_EDGE_GATEWAY_TOKEN.
+ */
+function renderEdgeConfig(py) {
+  const ep = brainEndpoint(py);
+  if (!ep) return null;
+  const { cfg } = ep;
+  mkdirSync(EDGE_STATE, { recursive: true });
+
+  let gatewayTokenEnv = {};
+  if (!process.env.AGENTICOS_EDGE_GATEWAY_TOKEN) {
+    const f = join(EDGE_STATE, ".gateway-token");
+    if (!existsSync(f)) {
+      writeFileSync(f, randomBytes(24).toString("hex"), { mode: 0o600 });
+      chmodSync(f, 0o600);
+    }
+    gatewayTokenEnv = { AGENTICOS_EDGE_GATEWAY_TOKEN: readFileSync(f, "utf8").trim() };
+  }
+
+  const firstAgent = cfg.brain.executors.find((e) => e.kind === "agent");
+  const pluginConfig = {
+    baseUrl: ep.url,
+    timeoutMs: cfg.bridge.timeout_ms,
+    ...(firstAgent ? { defaultTarget: { kind: "agent", id: firstAgent.id } } : {}),
+    // Always set: the launcher guarantees AGENTICOS_BRIDGE_TOKEN is in the env of
+    // every process it starts (operator-supplied or generated). Fail-closed on
+    // the OpenClaw side too: an unset variable is a config load error there.
+    authToken: "${AGENTICOS_BRIDGE_TOKEN}",
+  };
+  // OpenClaw's root schema is additionalProperties:false, so provenance goes in a
+  // sibling file rather than a "$comment" key (rejected at load — verified).
+  writeFileSync(join(EDGE_STATE, "README.txt"),
+    "openclaw.json here is GENERATED by bin/agenticos from ../../agenticos.config.yaml on every\n" +
+    "doctor/up/edge invocation. Do not edit it; edit the YAML. Tokens are ${ENV} references.\n");
+  const gatewayPort = Number(process.env.AGENTICOS_EDGE_GATEWAY_PORT ?? 18789);
+  const rendered = {
+    gateway: { mode: "local", port: gatewayPort, auth: { mode: "token", token: "${AGENTICOS_EDGE_GATEWAY_TOKEN}" } },
+    // Plugin tools are registered `optional`, which OpenClaw treats as
+    // "needs explicit user opt-in" per agent. Without this, the plugin loads
+    // but no agent may call it and the loop answers "tool isn't available"
+    // (observed). Opting in here is what makes the brain reachable from an
+    // agent run, not only from `tools.invoke`.
+    tools: { alsoAllow: ["agenticos_brain_turn", "agenticos_brain_approve"] },
+    plugins: {
+      enabled: true,
+      allow: ["agenticos-brain"],
+      entries: { "agenticos-brain": { enabled: true, config: pluginConfig } },
+    },
+  };
+  writeFileSync(EDGE_CONFIG, JSON.stringify(rendered, null, 2) + "\n");
+  const gov = governanceEnv(cfg);
+  if (gov.error) { bad("governance", gov.error); return null; }
+  return {
+    path: EDGE_CONFIG, gatewayPort, ep, governance: gov,
+    env: { OPENCLAW_CONFIG_PATH: EDGE_CONFIG, OPENCLAW_STATE_DIR: EDGE_STATE, ...gatewayTokenEnv, ...bridgeTokenEnv(), ...gov.env },
+  };
+}
+
+/**
+ * Kill whatever listens on a port we own. The edge gateway re-execs itself as a
+ * detached "openclaw-gateway" process, so the child pid we spawned is NOT the
+ * listener; signalling it leaves the real gateway running. Port-based teardown
+ * is deterministic, and every port here comes from our own rendered config.
+ */
+function killListeners(port) {
+  for (let i = 0; i < 8; i++) {
+    const r = capture("lsof", [`-tiTCP:${port}`, "-sTCP:LISTEN"]);
+    const pids = (r.stdout || "").split(/\s+/).filter(Boolean);
+    if (pids.length === 0) return;
+    for (const pid of pids) { try { process.kill(Number(pid), "SIGTERM"); } catch {} }
+    spawnSync("sleep", ["0.5"]);
+  }
+}
+
+function waitHealthy(url, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const probe = capture("curl", ["-sf", `${url}/v1/bridge/health`]);
+    if (probe.status === 0) return true;
+    spawnSync("sleep", ["0.25"]);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 
 function doctor() {
   console.log(c.b("\nAgenticOS doctor\n"));
   let failures = 0;
 
-  const cfg = readConfig();
-  cfg ? ok("config", `${cfg.path} (contract ${cfg.contract})`) : (bad("config missing"), failures++);
-
-  const node = process.versions.node;
-  ok("node", `v${node}`);
+  existsSync(CONFIG) ? ok("config", CONFIG) : (bad("config missing", CONFIG), failures++);
+  ok("node", `v${process.versions.node}`);
 
   const py = python();
-  const pv = spawnSync(py, ["--version"], { encoding: "utf8" });
-  pv.status === 0 ? ok("python", pv.stdout.trim() || pv.stderr.trim()) : (bad("python not found", py), failures++);
-
-  // Brain plane import check — the real one, not a file-exists check.
-  const brainCheck = spawnSync(
-    py,
-    ["-c", "import agno; from agno.agent import Agent; from agno.os import AgentOS; print(agno.__version__)"],
-    { encoding: "utf8", cwd: BRAIN },
-  );
-  brainCheck.status === 0
-    ? ok("brain plane", `agno ${brainCheck.stdout.trim()} imports`)
-    : (bad("brain plane import failed", (brainCheck.stderr || "").split("\n").pop()), failures++);
-
-  // Bridge contract check.
-  const bridgeCheck = spawnSync(
-    py,
-    ["-c", "from agenticos_bridge import CONTRACT_VERSION; print(CONTRACT_VERSION)"],
-    { encoding: "utf8", env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py") } },
-  );
-  bridgeCheck.status === 0
-    ? ok("bridge", `contract ${bridgeCheck.stdout.trim()}`)
-    : (bad("bridge import failed"), failures++);
-
-  // Edge plane check.
-  if (existsSync(join(EDGE, "node_modules"))) {
-    const edgeCheck = spawnSync("node", ["openclaw.mjs", "--version"], { encoding: "utf8", cwd: EDGE });
-    edgeCheck.status === 0
-      ? ok("edge plane", edgeCheck.stdout.trim())
-      : (bad("edge plane failed to run"), failures++);
-  } else {
-    bad("edge plane deps not installed", "run: agenticos install");
+  if (!py) {
+    bad("python", "no repo-local .venv and AGENTICOS_PYTHON unset — run: agenticos install");
     failures++;
+  } else {
+    const pv = capture(py, ["--version"]);
+    pv.status === 0 ? ok("python", `${pv.stdout.trim() || pv.stderr.trim()} (${py})`) : (bad("python broken", py), failures++);
+
+    const brain = capture(
+      py,
+      ["-c", "import agno; from agno.os import AgentOS; print(agno.__version__)"],
+      { env: pyEnv(), cwd: BRAIN },
+    );
+    brain.status === 0
+      ? ok("brain plane", `agno ${brain.stdout.trim()} imports`)
+      : (bad("brain plane import failed", (brain.stderr || "").trim().split("\n").pop()), failures++);
+
+    const bridge = capture(py, ["-c", "from agenticos_bridge import CONTRACT_VERSION; print(CONTRACT_VERSION)"], { env: pyEnv() });
+    bridge.status === 0 ? ok("bridge", `contract ${bridge.stdout.trim()}`) : (bad("bridge import failed", (bridge.stderr || "").trim().split("\n").pop()), failures++);
+
+    // The config must LOAD (fail-closed ${VAR}) and describe real executors.
+    const cfg = capture(
+      py,
+      [
+        "-c",
+        [
+          "from agenticos_brain import load_config",
+          "c = load_config()",
+          "ex = c.brain.executors",
+          "kinds = {k: sum(1 for e in ex if e.kind == k) for k in ('agent','team','workflow')}",
+          "print(f\"{len(ex)} executors {kinds} | db={c.brain.db_file} | idempotency={c.bridge.idempotency} | auth={'token' if c.bridge.auth_token else 'NONE'}\")",
+        ].join("\n"),
+      ],
+      { env: pyEnv() },
+    );
+    if (cfg.status === 0) {
+      ok("config loads", cfg.stdout.trim().replace(/auth=NONE/, "auth=token(generated)"));
+      process.env.AGENTICOS_BRIDGE_TOKEN
+        ? ok("bridge auth", "AGENTICOS_BRIDGE_TOKEN supplied by operator")
+        : ok("bridge auth", "token generated at data/.bridge-token (0600) and injected into every launched process");
+    } else {
+      bad("config refused (fail-closed)", (cfg.stderr || "").trim().split("\n").pop());
+      failures++;
+    }
+
+    // Executors must actually CONSTRUCT with a real db (REQ-0041) — not just parse.
+    const fac = capture(
+      py,
+      [
+        "-c",
+        [
+          "from agenticos_brain import load_config, build_executors",
+          "ex = build_executors(load_config())",
+          "allDb = all(getattr(e,'db',None) is not None for e in [*ex.agents.values(), *ex.teams.values(), *ex.workflows.values()])",
+          "print(f\"{ex.count()} built | all db-backed={allDb}\")",
+          "raise SystemExit(0 if allDb else 1)",
+        ].join("\n"),
+      ],
+      { env: pyEnv() },
+    );
+    fac.status === 0
+      ? ok("executors build from config", fac.stdout.trim())
+      : (bad("executor construction failed", (fac.stderr || fac.stdout || "").trim().split("\n").pop()), failures++);
   }
 
-  console.log(
-    failures === 0
-      ? c.g("\nAll planes healthy.\n")
-      : c.r(`\n${failures} check(s) failed.\n`),
-  );
+  if (!existsSync(join(EDGE, "node_modules"))) {
+    bad("edge plane deps not installed", "run: agenticos install");
+    failures++;
+  } else {
+    const ev = capture("node", ["openclaw.mjs", "--version"], { cwd: EDGE });
+    ev.status === 0 ? ok("edge plane", ev.stdout.trim()) : (bad("edge plane failed to run"), failures++);
+    existsSync(join(EDGE, "dist", "entry.mjs")) || existsSync(join(EDGE, "dist", "entry.js"))
+      ? ok("edge plane built", "dist/ present — gateway can start")
+      : (warn("edge plane NOT built", "dist/ missing — `agenticos edge gateway` cannot start until `agenticos install` builds it"), failures++);
+    existsSync(join(EDGE, "extensions", "agenticos-brain", "openclaw.plugin.json"))
+      ? ok("edge→brain extension", "extensions/agenticos-brain")
+      : (warn("edge→brain extension missing", "no runtime path from edge to brain"), failures++);
+  }
+
+  if (py) {
+    const wired = renderEdgeConfig(py);
+    if (wired) {
+      ok("edge config rendered", `${wired.path} → plugin agenticos-brain enabled → ${wired.ep.url}`);
+      const pl = capture("node", ["openclaw.mjs", "plugins", "list"], { cwd: EDGE, env: { ...process.env, ...wired.env } });
+      const line = (pl.stdout || "").split("\n").find((l) => l.includes("agenticos-brain")) ?? "";
+      /enabled|loaded/i.test(line) && !/disabled/i.test(line)
+        ? ok("edge runtime sees the plugin as ENABLED")
+        : (bad("edge runtime does not report the plugin enabled", line.trim().slice(0, 120) || "not listed"), failures++);
+    }
+  }
+
+  if (py) {
+    const rc = resolvedConfig(py);
+    if (rc) {
+      const gov = governanceEnv(rc);
+      if (gov.error) { bad("APEX kernel authority", gov.error); failures++; }
+      else if (gov.mode === "required") ok("APEX kernel authority", `mode=required · ${gov.cmd} governs every consequential tool call on both planes`);
+      else warn("APEX kernel authority", `mode=native — plane-local approval only${gov.cmd ? ` (launcher available at ${gov.cmd}; set governance.apex_authority.mode: required)` : ""}`);
+
+      const brainPort = Number(process.env.AGENTICOS_BRAIN_PORT ?? rc.brain.port);
+      const gwPort = Number(process.env.AGENTICOS_EDGE_GATEWAY_PORT ?? 18789);
+      for (const [label, port, envHint] of [["brain port", brainPort, "AGENTICOS_BRAIN_PORT"], ["gateway port", gwPort, "AGENTICOS_EDGE_GATEWAY_PORT"]]) {
+        const owner = portOwner(port);
+        if (!owner) ok(label, `:${port} free`);
+        else if (isOurs(owner)) ok(label, `:${port} held by our own pid ${owner.pid}`);
+        else { bad(label, `:${port} held by FOREIGN pid ${owner.pid} (${owner.cmd.slice(0, 70)}) — set ${envHint} or stop it; the launcher will not touch it`); failures++; }
+      }
+    }
+  }
+
+  console.log(failures === 0 ? c.g("\nAll planes healthy.\n") : c.r(`\n${failures} check(s) failed.\n`));
   return failures === 0 ? 0 : 1;
 }
 
 function install() {
   console.log(c.b("\nInstalling AgenticOS planes\n"));
-  console.log(c.dim("brain plane (python)"));
-  const r1 = run("uv", ["pip", "install", "-e", join(BRAIN, "libs", "agno")], {
-    env: { ...process.env, VIRTUAL_ENV: join(ROOT, "..", ".venv") },
-  });
+  console.log(c.dim("brain plane (python, pinned to tests/brain-constraints.txt)"));
+  const venv = join(ROOT, ".venv");
+  if (!existsSync(venv)) run("uv", ["venv", venv]);
+  const env = { ...process.env, VIRTUAL_ENV: venv };
+  const r1 = run("uv", ["pip", "install", "-c", join(ROOT, "tests", "brain-constraints.txt"), "-e", join(BRAIN, "libs", "agno"),
+    "fastapi", "uvicorn", "python-multipart", "PyJWT", "websockets", "openai", "pyyaml", "httpx", "pytest<9.1", "pytest-asyncio"], { env });
   console.log(c.dim("\nedge plane (node)"));
   const r2 = run("corepack", ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], { cwd: EDGE });
-  return (r1.status ?? 0) || (r2.status ?? 0);
+  console.log(c.dim("\nedge plane build (required for the gateway to start)"));
+  const r3 = run("corepack", ["pnpm", "build"], { cwd: EDGE });
+  return (r1.status ?? 0) || (r2.status ?? 0) || (r3.status ?? 0);
 }
 
-function brain() {
-  const cfg = readConfig();
-  console.log(c.b(`\nAgenticOS brain plane`) + c.dim(` :${cfg?.port ?? 8899}\n`));
-  const child = spawn(python(), [join(ROOT, "tests", "e2e", "brain_server.py")], {
-    stdio: "inherit",
-    env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py"), PORT: cfg?.port ?? "8899" },
-  });
+function brain(extraEnv = {}) {
+  const py = python();
+  if (!py) { bad("no python", "run: agenticos install"); return process.exit(1); }
+  const rc = resolvedConfig(py); const gov = rc ? governanceEnv(rc) : { env: {} };
+  if (gov.error) { bad("governance", gov.error); return process.exit(1); }
+  const child = spawn(py, ["-m", "agenticos_brain"], { stdio: "inherit", env: pyEnv({ ...gov.env, ...extraEnv }) });
   child.on("exit", (code) => process.exit(code ?? 0));
+  return child;
 }
 
 function edge(args) {
-  const child = spawn("node", ["openclaw.mjs", ...args], { stdio: "inherit", cwd: EDGE });
+  const py = python();
+  const wired = py ? renderEdgeConfig(py) : null;
+  if (!wired) warn("edge running WITHOUT the rendered agenticos config", "brain plugin will be disabled");
+  const child = spawn("node", ["openclaw.mjs", ...args], {
+    stdio: "inherit", cwd: EDGE, env: { ...process.env, ...(wired?.env ?? {}) },
+  });
   child.on("exit", (code) => process.exit(code ?? 0));
+  return child;
+}
+
+/**
+ * Boot both planes CONCURRENTLY. The brain and the edge gateway do not depend on
+ * each other to start, so starting them sequentially would serialise two
+ * multi-second boots for no reason. Health-wait runs after both are launched.
+ */
+function up() {
+  const py = python();
+  if (!py) { bad("no python", "run: agenticos install"); return 1; }
+  const wired = renderEdgeConfig(py);
+  if (!wired) { bad("config refused — see `agenticos doctor`"); return 1; }
+  const { ep } = wired;
+  for (const [label, port, hint] of [["brain", ep.port, "AGENTICOS_BRAIN_PORT"], ["gateway", wired.gatewayPort, "AGENTICOS_EDGE_GATEWAY_PORT"]]) {
+    const owner = portOwner(port);
+    if (owner && !isOurs(owner)) {
+      bad(`${label} port :${port} is held by a FOREIGN process`, `pid ${owner.pid}: ${owner.cmd.slice(0, 80)}`);
+      console.log(c.dim(`  refusing to start. Set ${hint}=<free port>, or stop that process yourself — the launcher never kills what it did not start.`));
+      return 1;
+    }
+    if (owner) killListeners(port); // a stale instance of ours from an earlier run
+  }
+  console.log(c.b("\nAgenticOS up") + c.dim(`  brain ${ep.url} · edge gateway :${wired.gatewayPort} · governance ${wired.governance.mode}\n`));
+
+  const brainProc = spawn(py, ["-m", "agenticos_brain"], { stdio: ["ignore", "inherit", "inherit"], env: pyEnv(wired.governance.env) });
+  const edgeBuilt = existsSync(join(EDGE, "dist", "entry.mjs")) || existsSync(join(EDGE, "dist", "entry.js"));
+  const edgeProc = edgeBuilt
+    ? spawn("node", ["openclaw.mjs", "gateway"], {
+        stdio: ["ignore", "inherit", "inherit"], cwd: EDGE, env: { ...process.env, ...wired.env },
+      })
+    : null;
+  if (!edgeProc) warn("edge gateway not started", "dist/ missing — run `agenticos install`; brain is up alone");
+
+  const healthy = waitHealthy(ep.url, 30_000);
+  healthy ? ok("brain healthy", `${ep.url}/v1/bridge/health`) : bad("brain did not become healthy in 30s");
+
+  const shutdown = () => {
+    try { brainProc.kill("SIGTERM"); } catch {}
+    try { edgeProc?.kill("SIGTERM"); } catch {}
+    killListeners(ep.port);
+    if (edgeProc) killListeners(wired.gatewayPort);
+  };
+  process.on("SIGINT", () => { shutdown(); process.exit(130); });
+  process.on("SIGTERM", () => { shutdown(); process.exit(143); });
+  brainProc.on("exit", (code) => { warn("brain exited", String(code)); shutdown(); process.exit(code ?? 1); });
+  edgeProc?.on("exit", (code) => { warn("edge exited", String(code)); shutdown(); process.exit(code ?? 1); });
+  return null; // keep running
+}
+
+/** Send one turn through the TypeScript bridge client — the same path the edge uses. */
+function turn(args) {
+  const text = args.filter((a) => !a.startsWith("--")).join(" ").trim();
+  const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : d; };
+  if (!text) { console.error("usage: agenticos turn <text> [--target agent:assistant] [--session id] [--url http://...]"); return 2; }
+  const py = python();
+  const ep = opt("url", null) ?? brainEndpoint(py)?.url ?? "http://127.0.0.1:8899";
+  const [kind, id] = (opt("target", "agent:assistant")).split(":");
+  const session = opt("session", `cli-${process.pid}`);
+  const script = `
+    import { BrainClient } from ${JSON.stringify(join(ROOT, "bridge", "ts", "src", "client.ts"))};
+    import { newTraceContext } from ${JSON.stringify(join(ROOT, "bridge", "ts", "src", "contract.ts"))};
+    const client = new BrainClient({ baseUrl: ${JSON.stringify(ep)}, authToken: process.env.AGENTICOS_BRIDGE_TOKEN });
+    const turn = { turn_id: crypto.randomUUID(), session_id: ${JSON.stringify(session)},
+      target: { kind: ${JSON.stringify(kind)}, id: ${JSON.stringify(id)} }, input: { text: ${JSON.stringify(text)} },
+      principal: { user_id: process.env.USER ?? "cli", channel: "cli", scopes: ["turns:create"] }, trace: newTraceContext() };
+    let out = ""; let last;
+    for await (const ev of client.dispatch(turn)) { last = ev; if (ev.type === "output.delta") process.stdout.write(ev.text);
+      else if (ev.type !== "run.completed") process.stderr.write("\\x1b[2m[" + ev.type + "]\\x1b[0m\\n"); }
+    process.stdout.write("\\n");
+    if (last?.type === "run.failed") { console.error("run.failed:", last.error); process.exit(1); }
+    console.error("\\x1b[2mtrace " + turn.trace.trace_id + " · session " + turn.session_id + " · usage " + JSON.stringify(last?.usage ?? {}) + "\\x1b[0m");
+  `;
+  const r = spawnSync("node", ["--input-type=module", "-e", script], { stdio: "inherit", env: { ...process.env, ...bridgeTokenEnv() } });
+  return r.status ?? 1;
 }
 
 function verify() {
   console.log(c.b("\nAgenticOS verification gates\n"));
+  const py = python();
+  if (!py) { bad("no python", "run: agenticos install"); return 1; }
   let failed = 0;
+  const gate = (label, fn) => { console.log(c.dim(`\n${label}`)); if (!fn()) failed++; };
 
-  console.log(c.dim("1/5  deletion ledger matches the tree"));
-  if (run("python3", [join(ROOT, "scripts", "check-deletion-ledger.py")]).status !== 0) failed++;
-
-  // Must use the venv interpreter: on the system python3 the import half of this
-  // gate cannot import agno at all, and previously reported "193 packages import
-  // cleanly" having imported ZERO. The script now refuses on such an interpreter.
-  console.log(c.dim("\n2/5  deletion integrity (dangling refs + real package imports)"));
-  if (run(python(), [join(ROOT, "scripts_audit_dangling_refs.py")]).status !== 0) failed++;
-
-  console.log(c.dim("\n3/5  edge-side contract types typecheck (strict)"));
-  const tsc = join(ROOT, "planes", "edge", "node_modules", ".bin", "tsc");
-  if (existsSync(tsc)) {
-    if (run(tsc, ["-p", join(ROOT, "bridge", "ts", "tsconfig.json")]).status !== 0) failed++;
-  } else {
-    console.log(c.y("  skipped: edge plane deps not installed (run: agenticos install)"));
-    failed++;
-  }
-
-  console.log(c.dim("\n4/5  bridge contract + brain-side suites"));
-  if (
-    run(python(), ["-m", "pytest", join(ROOT, "tests", "e2e"), "-q", "--asyncio-mode=auto"], {
-      env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py") },
-    }).status !== 0
-  )
-    failed++;
-
-  console.log(c.dim("\n5/5  cross-plane end-to-end (TS edge -> Python brain)"));
-  const server = spawn(python(), [join(ROOT, "tests", "e2e", "brain_server.py")], {
-    env: { ...process.env, PYTHONPATH: join(ROOT, "bridge", "py"), PORT: "8899" },
-    stdio: "ignore",
-    detached: true,
+  gate("1/9  deletion ledger matches the tree", () => run("python3", [join(ROOT, "scripts", "check-deletion-ledger.py")]).status === 0);
+  gate("2/9  deletion integrity (dangling refs + real package imports)", () => run(py, [join(ROOT, "scripts_audit_dangling_refs.py")]).status === 0);
+  gate("3/9  edge-side contract types: parity test + strict typecheck", () => {
+    const tsc = join(EDGE, "node_modules", ".bin", "tsc");
+    if (!existsSync(tsc)) { warn("skipped: edge deps not installed"); return false; }
+    return run("node", ["--test", join(ROOT, "bridge", "ts", "src", "contract.parity.test.ts")]).status === 0
+      && run(tsc, ["-p", join(ROOT, "bridge", "ts", "tsconfig.json")]).status === 0;
   });
-  const started = Date.now();
-  let up = false;
-  while (Date.now() - started < 30000) {
-    const probe = spawnSync("curl", ["-sf", "http://127.0.0.1:8899/v1/bridge/health"], { encoding: "utf8" });
-    if (probe.status === 0) { up = true; break; }
-    spawnSync("sleep", ["0.5"]);
-  }
-  if (!up) {
-    bad("brain plane did not come up within 30s");
-    failed++;
-  } else if (run("node", ["--test", join(ROOT, "tests", "e2e", "cross_plane.test.ts")]).status !== 0) {
-    failed++;
-  }
-  try { process.kill(-server.pid); } catch {}
+  gate("4/9  brain plane wiring: config, factory, one-app, persistence, trace, cross-process idempotency", () =>
+    run(py, ["-m", "pytest", join(ROOT, "tests", "brain"), "-q", "--asyncio-mode=auto"], { env: pyEnv() }).status === 0);
+  gate("5/9  bridge contract + brain-side suites (real APEX kernel when available)", () => {
+    const rc = resolvedConfig(py); const gov = rc ? governanceEnv(rc) : { env: {} };
+    const extra = { ...(gov.env ?? {}) };
+    if (gov.cmd) extra.APEX_AUTHORITY_REAL_LAUNCHER = gov.cmd; // un-skips the 20 real-kernel tests
+    return run(py, ["-m", "pytest", join(ROOT, "tests", "e2e"), "-q", "--asyncio-mode=auto", "-rs"], { env: pyEnv(extra) }).status === 0;
+  });
+  gate("6/9  edge→brain extension unit tests", () => {
+    const ext = join(EDGE, "extensions", "agenticos-brain");
+    if (!existsSync(ext)) { warn("skipped: extension not present"); return false; }
+    return run("corepack", ["pnpm", "exec", "vitest", "run", "extensions/agenticos-brain", "--reporter=dot"], { cwd: EDGE }).status === 0;
+  });
+  gate("7/9  cross-plane end-to-end against the REAL config-driven brain", () => {
+    const port = 8919; // isolated from any running instance
+    // verify.config.yaml resolves its db from ${AGENTICOS_VERIFY_DB}; the loader
+    // is fail-closed, so an unset variable makes the brain REFUSE to start (which
+    // is exactly what this gate's first run demonstrated). Give it an isolated db.
+    const verifyDb = join(ROOT, "data", ".verify", `xplane-${process.pid}.db`);
+    mkdirSync(dirname(verifyDb), { recursive: true });
+    const server = spawn(py, ["-m", "agenticos_brain"], {
+      env: pyEnv({
+        AGENTICOS_BRAIN_PORT: String(port),
+        AGENTICOS_CONFIG: join(ROOT, "tests", "brain", "verify.config.yaml"),
+        AGENTICOS_VERIFY_DB: verifyDb,
+      }),  // pyEnv() injects AGENTICOS_BRIDGE_TOKEN -> the brain REQUIRES it -> test client sends it
+      stdio: "ignore", detached: true,
+    });
+    try {
+      if (!waitHealthy(`http://127.0.0.1:${port}`, 30_000)) { bad("brain did not come up"); return false; }
+      return run("node", ["--test", join(ROOT, "tests", "e2e", "cross_plane.test.ts")], { env: { ...process.env, ...bridgeTokenEnv(), BRAIN_URL: `http://127.0.0.1:${port}` } }).status === 0;
+    } finally { try { process.kill(-server.pid); } catch {} killListeners(port); }
+  });
+
+  gate("8/9  edge gateway -> plugin -> brain -> database (authenticated, kernel-governed when available)", () =>
+    run("bash", [join(ROOT, "scripts", "e2e-gateway-brain.sh")], { env: { ...process.env, ...bridgeTokenEnv(), AGENTICOS_PYTHON: py } }).status === 0);
+
+  gate("9/9  LLM-initiated: real agent loop on a deterministic STUB model chooses the brain tool (kernel-governed)", () =>
+    run("bash", [join(ROOT, "scripts", "e2e-agent-loop-brain.sh")], { env: { ...process.env, ...bridgeTokenEnv(), AGENTICOS_PYTHON: py } }).status === 0);
 
   console.log(failed === 0 ? c.g("\nAll gates passed.\n") : c.r(`\n${failed} gate(s) failed.\n`));
   return failed === 0 ? 0 : 1;
@@ -191,17 +523,19 @@ function verify() {
 
 function usage() {
   console.log(`
-${c.b("AgenticOS")} ${c.dim("— one agent OS, two planes")}
+${c.b("AgenticOS")} ${c.dim("— one agent OS, two planes, one config")}
 
-  ${c.b("agenticos doctor")}     check both planes and the bridge
-  ${c.b("agenticos install")}    install brain (python) and edge (node) dependencies
-  ${c.b("agenticos brain")}      run the brain plane (agents/teams/workflows/knowledge)
-  ${c.b("agenticos edge")} ...   run the edge plane CLI (channels/gateway/sandbox)
-  ${c.b("agenticos verify")}     run every verification gate
-  ${c.b("agenticos matrix")}     show the capability decision matrix
+  ${c.b("agenticos doctor")}          check config, both planes, the bridge, the kernel authority
+  ${c.b("agenticos install")}         install + build both planes (repo-local .venv, pnpm, dist)
+  ${c.b("agenticos up")}              boot brain AND edge gateway concurrently
+  ${c.b("agenticos brain")}           boot the brain plane from agenticos.config.yaml
+  ${c.b("agenticos edge")} <args>     run the edge plane CLI (e.g. gateway, --help)
+  ${c.b("agenticos turn")} <text>     send a turn via the bridge client  [--target agent:assistant] [--session s]
+  ${c.b("agenticos verify")}          run every verification gate
+  ${c.b("agenticos matrix")}          show the capability decision matrix
 
-${c.dim("brain = Python (Agno lineage)  ·  edge = TypeScript (OpenClaw lineage)")}
-${c.dim("bridge contract: bridge/contract/turn.schema.json")}
+${c.dim("config: agenticos.config.yaml · contract: bridge/contract/turn.schema.json · data: data/")}
+${c.dim("env: AGENTICOS_BRIDGE_TOKEN · AGENTICOS_BRAIN_PORT · AGENTICOS_EDGE_GATEWAY_PORT/TOKEN · AGENTICOS_CONFIG · APEX_AUTHORITY_CMD/MODE")}
 `);
 }
 
@@ -209,8 +543,10 @@ const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "doctor": process.exit(doctor()); break;
   case "install": process.exit(install()); break;
+  case "up": { const r = up(); if (r !== null) process.exit(r); break; }
   case "brain": brain(); break;
   case "edge": edge(rest); break;
+  case "turn": process.exit(turn(rest)); break;
   case "verify": process.exit(verify()); break;
   case "matrix": run("cat", [join(ROOT, "docs", "DECISION-MATRIX.md")]); break;
   default: usage(); process.exit(cmd ? 1 : 0);

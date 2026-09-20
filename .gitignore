@@ -11,3 +11,6 @@ dist/
 _src/
 .venv*/
 .DS_Store
+
+# Runtime data: brain SQLite db, bridge idempotency store, rendered edge config, gateway state.
+data/

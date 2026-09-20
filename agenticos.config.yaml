@@ -20,10 +20,17 @@ bridge:
   base_url: "http://127.0.0.1:8899"
   # Fail closed: when set, the brain plane REQUIRES this bearer token.
   # Never inline a secret here - use a ${VAR} reference resolved at load time.
+  # This field is OPTIONAL-SECRET: an unset variable means "no token" and the
+  # brain logs that loudly at startup; every other ${VAR} in this file is
+  # fail-closed (unset => refuse to start).
   auth_token: "${AGENTICOS_BRIDGE_TOKEN}"
   # When set, a turn is refused unless the edge-asserted principal carries it.
   required_scope: "turns:create"
   timeout_ms: 120000
+  # Turn idempotency store. `sqlite` is durable and correct across multiple
+  # uvicorn workers/processes (atomic INSERT claim, WAL). `memory` is
+  # single-process only and exists for tests.
+  idempotency: sqlite
 
 brain:
   # Python plane - agents, teams, workflows, reasoning, knowledge, memory.
@@ -32,11 +39,49 @@ brain:
   # Provider-neutral default. Stock Agno hard-defaults to OpenAI at agent
   # construction (agno/agent/_init.py:88) and raises ImportError without the
   # OpenAI SDK; AgenticOS ships a zero-dependency default instead.
+  # Any executor may override with "<provider>:<model-id>", e.g.
+  # "anthropic:claude-sonnet-4-5" (requires that provider's SDK + key).
   default_model: "agenticos-deterministic"
+  # Real persistence for sessions, runs, memories, metrics, traces, approvals.
+  # One SQLite file per host by default; the bridge idempotency store sits
+  # beside it as <file>.bridge.db. Relative paths resolve against this file.
+  # Agno's other backends (postgres, mysql, mongo, redis, ...) are drop-in via
+  # the factory once their driver is installed; SQLite needs nothing extra.
+  db:
+    file: "data/agenticos-brain.db"
+  # Every executor below is REAL: constructed by the factory, backed by the db
+  # above, served on the AgentOS control plane AND reachable via /v1/turns.
+  # REQ-0041: a paused run can only be resumed from a db, so every executor
+  # is db-backed by construction.
   executors:
-    agents: []
-    teams: []
-    workflows: []
+    agents:
+      - id: assistant
+        name: Assistant
+        description: General-purpose assistant with persistent session history.
+        instructions:
+          - You are the AgenticOS assistant. Be concise and accurate.
+      - id: researcher
+        name: Researcher
+        description: Gathers and summarises information for the team.
+        instructions:
+          - Research the question and report findings with sources where possible.
+      - id: writer
+        name: Writer
+        description: Turns findings into a clear final answer.
+        instructions:
+          - Write the final response for the user from the material provided.
+    teams:
+      - id: triage
+        name: Triage Team
+        description: Coordinates researcher and writer for multi-step questions.
+        members: [researcher, writer]
+        instructions:
+          - Delegate research first, then hand the findings to the writer.
+    workflows:
+      - id: research_pipeline
+        name: Research Pipeline
+        description: Deterministic research -> write sequence.
+        steps: [researcher, writer]
 
 edge:
   # TypeScript plane - channels, gateway, devices, sandbox, browser, plugins.
@@ -44,6 +89,18 @@ edge:
   gateway:
     enabled: true
   channels: []
+
+governance:
+  # APEX kernel authority — a separate project (../APEX-OS). With mode `required`,
+  # every consequential tool call on BOTH planes consults the kernel first and is
+  # DENIED if the kernel cannot be reached: fail closed, never silently ungoverned.
+  # `native` keeps only plane-local approval policy and both planes log a WARNING.
+  # `cmd` may be set via ${APEX_AUTHORITY_CMD}; when unset the launcher resolves the
+  # well-known sibling checkout ../APEX-OS/kernel/bin/apex-authority. In `required`
+  # mode, no resolvable launcher => `agenticos up` refuses to start.
+  apex_authority:
+    mode: required
+    cmd: "${APEX_AUTHORITY_CMD}"
 
 observability:
   # The edge OTLP stack won; the brain plane exports into the same collector

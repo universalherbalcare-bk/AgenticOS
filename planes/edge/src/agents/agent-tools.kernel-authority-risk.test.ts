@@ -191,3 +191,24 @@ describe("EDGE_TOOL_KERNEL_RISK (fixed table)", () => {
     expect(joined).toContain("unknown tools at R2");
   });
 });
+
+describe("AgenticOS brain plane tools (extensions/agenticos-brain)", () => {
+  it("rates agenticos_brain_turn R1: a delegation to another kernel-governed plane, like sessions_spawn", () => {
+    const turn = resolveEdgeToolKernelRisk({ toolName: "agenticos_brain_turn", params: { text: "hi" } });
+    const spawn = resolveEdgeToolKernelRisk({ toolName: "sessions_spawn", params: {} });
+    expect(turn).toMatchObject({ governed: true, class: "agents", risk: "R1" });
+    expect(turn.risk).toBe(spawn.risk);
+  });
+
+  it("keeps agenticos_brain_approve at R2: a model must never approve its own paused tool", () => {
+    const approve = resolveEdgeToolKernelRisk({
+      toolName: "agenticos_brain_approve",
+      params: { turn_id: "t", approval_id: "a", decision: "approve" },
+    });
+    expect(approve).toMatchObject({ governed: true, class: "agents", risk: "R2" });
+  });
+
+  it("does not let an unrelated plugin tool inherit the brain's R1 (unknown stays R2)", () => {
+    expect(resolveEdgeToolKernelRisk({ toolName: "agenticos_brain_something_else", params: {} }).risk).toBe("R2");
+  });
+});
