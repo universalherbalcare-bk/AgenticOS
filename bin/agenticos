@@ -359,7 +359,7 @@ function install() {
   if (!existsSync(venv)) run("uv", ["venv", venv]);
   const env = { ...process.env, VIRTUAL_ENV: venv };
   const r1 = run("uv", ["pip", "install", "-c", join(ROOT, "tests", "brain-constraints.txt"), "-e", join(BRAIN, "libs", "agno"),
-    "fastapi", "uvicorn", "python-multipart", "PyJWT", "websockets", "openai", "pyyaml", "httpx", "pytest<9.1", "pytest-asyncio"], { env });
+    "fastapi", "uvicorn", "python-multipart", "PyJWT", "websockets", "openai", "pyyaml", "sqlalchemy", "httpx", "pytest<9.1", "pytest-asyncio"], { env });
   console.log(c.dim("\nedge plane (node)"));
   const r2 = run("corepack", ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], { cwd: EDGE });
   console.log(c.dim("\nedge plane build (required for the gateway to start)"));
