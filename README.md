@@ -142,11 +142,18 @@ Every claim below was produced by running code in the session that built this.
 proof uses a deterministic in-process model, so the *plumbing* is genuinely proven while inference is
 neither exercised nor claimed.
 
-**Hosted CI** runs on every push to `https://github.com/universalherbalcare-bk/AgenticOS` (private). The first
+**Hosted CI** runs on every push to `https://github.com/universalherbalcare-bk/AgenticOS` (public). The first
 runs found three runner-only defects (a missing `sqlalchemy` dependency for real persistence, a gitleaks-action
 first-push range bug, and an environment-dependent test) — all recorded in `docs/CORRECTIONS.md` #27–29. The
 gateway and agent-loop end-to-end gates run on the runner with `governance=native` (no APEX-OS checkout
-there) and `required` on developer machines that have it. Branch protection needs GitHub Pro or a public repo.
+there) and `required` on developer machines that have it.
+
+**Branch protection on `main`** (verified via the GitHub API, not just set): all five CI jobs are required
+status checks on an up-to-date branch, the rule is enforced for admins, force-pushes and deletion are
+blocked, and review threads must be resolved. No approving review is required, so a single maintainer can
+merge their own green PR. Direct pushes to `main` are rejected for everyone — every change is
+branch → pull request → green CI → merge. This is enforcement-by-configuration, not a proof: an admin can
+edit the rule.
 
 **Adversarial review and independent verification** were run against this tree; their reports are in
 `docs/analysis/07-adversarial-review.md` and `08-verification.md`, and the defects they found — including
